@@ -38,7 +38,7 @@ Des versions prêtes à l’emploi, avec FFmpeg inclus, sont publiées dans les 
 
 Ces versions ne sont pas signées par Apple ni par Microsoft. À la première ouverture :
 
-- **macOS** : si le Mac refuse d’ouvrir l’app, allez dans *Réglages Système → Confidentialité et sécurité* et cliquez sur « Ouvrir quand même » ;
+- **macOS** : le Mac bloque la première ouverture (« Apple n’a pas pu confirmer… »). Cliquez sur **Terminé**, ouvrez *Réglages Système → Confidentialité et sécurité*, descendez jusqu’au message sur Onde2Vid, cliquez sur **Ouvrir quand même** (votre mot de passe est demandé), puis relancez l’app. Autre solution, dans le Terminal (en adaptant le chemin) : `xattr -dr com.apple.quarantine ~/Downloads/Onde2Vid/Onde2Vid.app` ;
 - **Windows** : si SmartScreen affiche « Windows a protégé votre ordinateur », cliquez sur « Informations complémentaires », puis « Exécuter quand même ».
 
 La version autonome range vos fichiers dans le dossier `Documents/Onde2Vid` (sous-dossiers `input/` et `output/`).
