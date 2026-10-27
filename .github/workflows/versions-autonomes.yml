@@ -178,10 +178,15 @@ jobs:
             echo "Windows : double-cliquez sur Onde2Vid.exe. Si « Windows a protégé votre ordinateur »"
             echo "  s'affiche : « Informations complémentaires », puis « Exécuter quand même »."
             echo ""
-            echo "macOS : double-cliquez sur Onde2Vid.app. Le Mac bloque la première ouverture :"
-            echo "  cliquez sur « Terminé », puis Réglages Système > Confidentialité et sécurité,"
-            echo "  message sur Onde2Vid > « Ouvrir quand même » (mot de passe), et relancez l'app."
-            echo "  Ou dans le Terminal : xattr -dr com.apple.quarantine <chemin de Onde2Vid.app>"
+            if [ "$HAS_APPLE_CERT" = "true" ]; then
+              echo "macOS : double-cliquez sur Onde2Vid.app (vous pouvez la glisser dans Applications)."
+              echo "  L'app est signée et vérifiée par Apple : elle s'ouvre normalement."
+            else
+              echo "macOS : double-cliquez sur Onde2Vid.app. Le Mac bloque la première ouverture :"
+              echo "  cliquez sur « Terminé », puis Réglages Système > Confidentialité et sécurité,"
+              echo "  message sur Onde2Vid > « Ouvrir quand même » (mot de passe), et relancez l'app."
+              echo "  Ou dans le Terminal : xattr -dr com.apple.quarantine <chemin de Onde2Vid.app>"
+            fi
             echo ""
             echo "Linux : lancez Onde2Vid (double-clic, ou ./Onde2Vid dans un terminal)."
             echo ""
