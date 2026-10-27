@@ -62,7 +62,17 @@ python3 Onde2Vid.py
 
 Une interface s’ouvre automatiquement dans votre navigateur. Elle est servie uniquement sur votre ordinateur à l’adresse `127.0.0.1`.
 
-Au premier lancement, un raccourci est créé à côté du script (`Onde2Vid.command` sur macOS, `Onde2Vid.bat` sous Windows) : les fois suivantes, il suffit de double-cliquer dessus.
+### Lancer Onde2Vid sans terminal
+
+Au premier lancement, Onde2Vid crée lui-même son raccourci, avec son icône :
+
+| Système | La première fois | Les fois suivantes |
+|---|---|---|
+| macOS | `python3 Onde2Vid.py` dans le Terminal | double-clic sur **Onde2Vid.app**, créée dans le dossier (vous pouvez la glisser dans le Dock) |
+| Windows | double-clic sur **Onde2Vid.pyw** (aucune fenêtre noire ne s’ouvre) | **Onde2Vid** dans le menu Démarrer, ou `Onde2Vid.pyw` |
+| Linux | `python3 Onde2Vid.py` dans un terminal | **Onde2Vid** dans le menu des applications |
+
+Lancé de cette façon, Onde2Vid s’arrête tout seul une vingtaine de secondes après la fermeture de son onglet (jamais pendant une conversion). S’il est déjà ouvert, un nouveau double-clic ramène simplement son onglet. Les messages sont enregistrés dans `onde2vid.log`.
 
 Déposez vos MP3 dans l’interface, choisissez vos réglages, puis cliquez sur **Convertir**.
 

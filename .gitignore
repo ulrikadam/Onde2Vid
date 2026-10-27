@@ -64,3 +64,7 @@ Image de demo/
 *(ancienne version)*.py
 Onde2Vid.command
 Onde2Vid.bat
+
+# Créés au lancement
+Onde2Vid.app/
+onde2vid.log

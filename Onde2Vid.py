@@ -8,6 +8,9 @@ https://github.com/ulrikadam/Onde2Vid — licence GNU GPL v3.0
                                    (avec les derniers réglages enregistrés)
   python3 Onde2Vid.py --batch --force   → reconvertit aussi ce qui existe déjà
 
+Sans terminal : au premier lancement, Onde2Vid crée son raccourci (Mac : Onde2Vid.app,
+Windows : menu Démarrer ou double-clic sur Onde2Vid.pyw, Linux : menu des applications).
+
 Dossiers (à côté du script, créés automatiquement) :
   input/            tes MP3 (+ images de fond éventuelles)
   input/jaquettes/  les jaquettes ajoutées depuis l'interface (une par morceau)
@@ -41,6 +44,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.request
 import webbrowser
 from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -155,6 +160,7 @@ FONT_REGULAR = [
 TOOLS = {"ffmpeg": None, "drawtext": False, "x264": False, "font": None, "font2": None}
 ASSET_LOCK = threading.RLock()      # préparation des images/cartes (un seul fil à la fois)
 PREVIEW_LOCK = threading.Lock()
+NO_WINDOW = {"creationflags": 0x08000000} if sys.platform == "win32" else {}   # pas de fenêtre noire
 
 
 def prepare_local_binary(path: Path) -> None:
@@ -187,7 +193,7 @@ def find_ffmpeg() -> str | None:
 
 def run_text(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", stdin=subprocess.DEVNULL)
+                          errors="replace", stdin=subprocess.DEVNULL, **NO_WINDOW)
 
 
 def ensure_tools() -> None:
@@ -979,7 +985,7 @@ def bass_envelope(mp3: Path, fps: int, start: float, dur: float | None) -> list[
         cmd += ["-t", f"{dur:.3f}"]
     cmd += ["-i", str(mp3), "-vn", "-ac", "1", "-af",
             f"aresample=2400,lowpass=f=140,lowpass=f=140,aresample={sr}", "-f", "s16le", "-"]
-    raw = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL).stdout
+    raw = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, **NO_WINDOW).stdout
     a = array("h")
     a.frombytes(raw[:len(raw) // 2 * 2])
     if sys.byteorder == "big":
@@ -1326,7 +1332,7 @@ def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) 
     cmd += ["-shortest", "-movflags", "+faststart", str(part)]
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errlog:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errlog, stdin=subprocess.DEVNULL,
-                                text=True, encoding="utf-8", errors="replace", bufsize=1)
+                                text=True, encoding="utf-8", errors="replace", bufsize=1, **NO_WINDOW)
         if set_proc:
             set_proc(proc)
         speed = ""
@@ -1479,6 +1485,9 @@ TOKEN = secrets.token_hex(16)
 SETTINGS = load_settings()
 SERVER: ThreadingHTTPServer | None = None
 ALLOWED_HOSTS: set[str] = set()
+ACTIVITY = {"seen": time.monotonic(), "bye": 0.0}   # dernière visite de la page / onglet fermé
+IDLE_QUIT = 600    # mode application : arrêt après 10 min sans aucun onglet ouvert…
+BYE_GRACE = 20     # … ou 20 s après la fermeture de l'onglet (le temps d'un rechargement)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1528,9 +1537,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._host_ok():
             return self._send(403, b"Forbidden", "text/plain")
+        ACTIVITY["seen"] = time.monotonic()
         url = urlparse(self.path)
         q = parse_qs(url.query)
-        if url.path == "/":
+        if url.path == "/api/ping":
+            self._json({"app": APP_NAME})
+        elif url.path == "/":
             self._send(200, HTML.replace("__TOKEN__", TOKEN).encode(), "text/html; charset=utf-8")
         elif url.path == "/api/state":
             self._json(app_state())
@@ -1558,10 +1570,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global SETTINGS
-        if not self._host_ok() or self.headers.get("X-Token") != TOKEN:
-            return self._send(403, b"Forbidden", "text/plain")
         url = urlparse(self.path)
         q = parse_qs(url.query)
+        token = self.headers.get("X-Token") or q.get("t", [""])[0]
+        if not self._host_ok() or token != TOKEN:
+            return self._send(403, b"Forbidden", "text/plain")
+        if url.path == "/api/bye":         # onglet fermé (navigator.sendBeacon)
+            ACTIVITY["bye"] = time.monotonic()
+            return self._send(204, b"", "text/plain")
+        ACTIVITY["seen"] = time.monotonic()
 
         if url.path == "/api/upload":
             length = int(self.headers.get("Content-Length") or 0)
@@ -1672,35 +1689,194 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": "Inconnu"}, 404)
 
 
-def make_launcher() -> None:
-    """Crée (ou répare) un lanceur à double-cliquer à côté du script."""
-    script = Path(__file__).name
-    if sys.platform == "darwin":
-        p = SCRIPT_DIR / f"{APP_NAME}.command"
-        body = f'#!/bin/bash\ncd "$(dirname "$0")"\n"{sys.executable}" "{script}"\n'
-    elif sys.platform == "win32":
-        p = SCRIPT_DIR / f"{APP_NAME}.bat"
-        body = f'@echo off\r\ncd /d "%~dp0"\r\n"{sys.executable}" "{script}"\r\n'
-    else:
-        return
+MAC_LAUNCHER = r'''#!/bin/bash
+# Lanceur d'Onde2Vid (créé automatiquement par Onde2Vid.py)
+APP="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT="__SCRIPT__"
+[ -f "$SCRIPT" ] || SCRIPT="$(dirname "$APP")/Onde2Vid.py"
+PY=""
+for P in "__PYTHON__" /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+         /Library/Frameworks/Python.framework/Versions/Current/bin/python3 /usr/bin/python3; do
+  if [ -x "$P" ]; then PY="$P"; break; fi
+done
+if [ -z "$PY" ] || [ ! -f "$SCRIPT" ]; then
+  osascript -e 'display alert "Onde2Vid" message "Python 3 ou le fichier Onde2Vid.py est introuvable. Installe Python depuis python.org et garde Onde2Vid.app dans le dossier Onde2Vid." as critical' >/dev/null 2>&1
+  exit 1
+fi
+cd "$(dirname "$SCRIPT")" || exit 1
+nohup "$PY" "$SCRIPT" --app >/dev/null 2>&1 &
+exit 0
+'''
+
+MAC_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Onde2Vid</string>
+  <key>CFBundleDisplayName</key><string>Onde2Vid</string>
+  <key>CFBundleIdentifier</key><string>io.github.ulrikadam.onde2vid</string>
+  <key>CFBundleExecutable</key><string>Onde2Vid</string>
+  <key>CFBundleIconFile</key><string>icon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>LSMinimumSystemVersion</key><string>10.13</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+"""
+
+
+def _write_if_changed(p: Path, text: str, mode: int | None = None) -> bool:
     try:
-        if p.exists() and f'"{script}"' in p.read_text(encoding="utf-8", errors="replace"):
-            return
-        with open(p, "w", encoding="utf-8", newline="") as fh:
-            fh.write(body)
-        if sys.platform == "darwin":
-            p.chmod(0o755)
-        print(f"➜ Raccourci créé : la prochaine fois, double-clique sur « {p.name} ».")
+        if p.read_text(encoding="utf-8", errors="replace") == text:
+            return False
     except OSError:
+        pass
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+    if mode is not None:
+        p.chmod(mode)
+    return True
+
+
+def _bash_inner(s: str) -> str:
+    """Texte placé entre guillemets doubles dans un script bash."""
+    return re.sub(r'([\\"$`])', r"\\\1", s)
+
+
+def mac_app() -> bool:
+    """Onde2Vid.app : une vraie application Mac (icône, pas de Terminal). True si elle vient d'être créée."""
+    app = SCRIPT_DIR / f"{APP_NAME}.app"
+    new = not app.exists()
+    c = app / "Contents"
+    launcher = (MAC_LAUNCHER.replace("__SCRIPT__", _bash_inner(str(Path(__file__).resolve())))
+                .replace("__PYTHON__", _bash_inner(sys.executable or "")))
+    changed = _write_if_changed(c / "MacOS" / APP_NAME, launcher, 0o755)
+    changed |= _write_if_changed(c / "Info.plist", MAC_PLIST)
+    icon, dst = SCRIPT_DIR / "assets" / "icon.icns", c / "Resources" / "icon.icns"
+    if icon.is_file() and (not dst.is_file() or dst.stat().st_size != icon.stat().st_size):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(icon, dst)
+        changed = True
+    if changed:
+        os.utime(app)                      # le Finder rafraîchit l'icône
+    return new
+
+
+def windows_shortcut() -> bool:
+    """Raccourci « Onde2Vid » (avec l'icône) dans le menu Démarrer. True s'il vient d'être créé."""
+    progs = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    lnk = progs / f"{APP_NAME}.lnk"
+    if not progs.is_dir() or lnk.exists():
+        return False
+    exe = Path(sys.executable)
+    target = exe.with_name("pythonw.exe") if exe.with_name("pythonw.exe").is_file() else exe
+    icon = SCRIPT_DIR / "assets" / "icon.ico"
+    env = dict(os.environ, O2V_LNK=str(lnk), O2V_TARGET=str(target),
+               O2V_ARGS=f'"{Path(__file__).resolve()}" --app', O2V_DIR=str(SCRIPT_DIR),
+               O2V_ICON=f"{icon if icon.is_file() else target},0")
+    ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:O2V_LNK);"
+          "$s.TargetPath=$env:O2V_TARGET;$s.Arguments=$env:O2V_ARGS;"
+          "$s.WorkingDirectory=$env:O2V_DIR;$s.IconLocation=$env:O2V_ICON;"
+          "$s.Description='Onde2Vid';$s.Save()")
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                    "-Command", ps], env=env, capture_output=True, timeout=30, **NO_WINDOW)
+    return lnk.exists()
+
+
+def linux_desktop_entry(python: str, script: Path, icon: Path | None) -> str:
+    def q(s) -> str:                       # règles de guillemets des fichiers .desktop
+        s = str(s).replace("\\", "\\\\\\\\")
+        return '"' + re.sub(r'(["`$])', r"\\\1", s) + '"'
+    lines = ["[Desktop Entry]", "Type=Application", f"Name={APP_NAME}",
+             "Comment=Transformer des MP3 en vidéos animées",
+             f"Exec={q(python)} {q(script)} --app", "Terminal=false",
+             "Categories=AudioVideo;Audio;Video;"]
+    if icon:
+        lines.append(f"Icon={icon}")
+    return "\n".join(lines) + "\n"
+
+
+def linux_desktop() -> bool:
+    """Entrée « Onde2Vid » dans le menu des applications. True si elle vient d'être créée."""
+    base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    p = base / "applications" / "onde2vid.desktop"
+    new = not p.exists()
+    icon = SCRIPT_DIR / "assets" / "icon.png"
+    _write_if_changed(p, linux_desktop_entry(sys.executable, Path(__file__).resolve(),
+                                             icon if icon.is_file() else None), 0o755)
+    return new
+
+
+def make_launcher() -> None:
+    """Crée (ou met à jour) le raccourci qui lance Onde2Vid sans terminal."""
+    try:
+        if sys.platform == "darwin" and mac_app():
+            print(f"➜ {APP_NAME}.app a été créé dans le dossier : la prochaine fois, double-clique "
+                  "dessus (tu peux aussi le glisser dans le Dock).")
+        elif sys.platform == "win32" and windows_shortcut():
+            print(f"➜ Raccourci « {APP_NAME} » ajouté au menu Démarrer.")
+        elif sys.platform.startswith("linux") and linux_desktop():
+            print(f"➜ « {APP_NAME} » a été ajouté au menu des applications.")
+    except (OSError, subprocess.SubprocessError):
         pass
 
 
-def run_gui(open_browser: bool = True) -> None:
+def find_running() -> str | None:
+    """Adresse d'une interface Onde2Vid déjà ouverte sur cet ordinateur, sinon None."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for port in range(8765, 8785):
+        url = f"http://127.0.0.1:{port}/"
+        try:
+            with opener.open(url + "api/ping", timeout=0.5) as r:
+                if json.loads(r.read() or b"{}").get("app") == APP_NAME:
+                    return url
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def watchdog() -> None:
+    """Mode application : arrêt quand plus aucun onglet n'est ouvert (jamais pendant une conversion)."""
+    while True:
+        time.sleep(5)
+        if QUEUE.running or PREVIEW_LOCK.locked():
+            continue
+        now, seen, bye = time.monotonic(), ACTIVITY["seen"], ACTIVITY["bye"]
+        if (bye > seen and now - bye > BYE_GRACE) or now - seen > IDLE_QUIT:
+            print("  Plus aucun onglet ouvert : arrêt automatique.")
+            SERVER.shutdown()
+            return
+
+
+def start_log() -> None:
+    """Mode application (sans terminal) : les messages vont dans onde2vid.log."""
+    log = SCRIPT_DIR / "onde2vid.log"
+    try:
+        if log.exists() and log.stat().st_size > 1_000_000:
+            log.unlink()
+        fh = open(log, "a", encoding="utf-8", buffering=1)
+    except OSError:
+        return
+    sys.stdout = sys.stderr = fh
+    print(f"\n── {time.strftime('%Y-%m-%d %H:%M:%S')} : démarrage d'{APP_NAME}")
+
+
+def run_gui(open_browser: bool = True, app_mode: bool = False) -> None:
     global SERVER
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ensure_tools()
     make_launcher()
+    running = find_running()
+    if running:                            # déjà ouvert : on ramène simplement l'onglet
+        print(f"\n  {APP_NAME} est déjà ouvert : {running}\n")
+        if open_browser:
+            webbrowser.open(running)
+        shutil.rmtree(TMP, ignore_errors=True)
+        return
     for port in list(range(8765, 8785)) + [0]:
         try:
             SERVER = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -1711,7 +1887,11 @@ def run_gui(open_browser: bool = True) -> None:
     ALLOWED_HOSTS.update({f"127.0.0.1:{port}", f"localhost:{port}"})
     url = f"http://127.0.0.1:{port}/"
     print(f"\n  {APP_NAME} — interface ouverte dans ton navigateur : {url}")
-    print("  (laisse cette fenêtre ouverte ; Ctrl+C ou le bouton « Quitter » pour arrêter)\n")
+    if app_mode:
+        print("  (mode application : arrêt automatique quand l'onglet est fermé)\n")
+        threading.Thread(target=watchdog, daemon=True).start()
+    else:
+        print("  (laisse cette fenêtre ouverte ; Ctrl+C ou le bouton « Quitter » pour arrêter)\n")
     if not TOOLS["ffmpeg"]:
         print(f"  ⚠ FFmpeg introuvable : dépose le fichier 'ffmpeg' dans {SCRIPT_DIR}\n")
     if open_browser:
@@ -2068,7 +2248,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   <p class="hint err" id="cvErr"></p>
 </div></div>
 
-<div class="overlay" id="offline"><div><h3>Interface arrêtée</h3><p id="offMsg">Le programme ne répond plus. Relance <b>Onde2Vid.py</b> (ou « Onde2Vid.command ») pour continuer.</p></div></div>
+<div class="overlay" id="offline"><div><h3>Interface arrêtée</h3><p id="offMsg">Onde2Vid ne répond plus (il s'arrête tout seul quand son onglet reste fermé). Relance-le pour continuer.</p></div></div>
 
 <script>
 const TOKEN = "__TOKEN__";
@@ -2372,7 +2552,7 @@ $("#go").onclick = async () => {
 $("#quit").onclick = async () => {
   if (S && S.running && !confirm("Une conversion est en cours. Quitter quand même ?")) return;
   await post("/api/quit"); clearTimeout(timer);
-  $("#offMsg").textContent = "Tu peux fermer cet onglet. Pour revenir, relance le script.";
+  $("#offMsg").textContent = "Tu peux fermer cet onglet. Pour revenir, relance Onde2Vid.";
   $("#offline").classList.add("on");
 };
 $("#defPick").onchange = async e => {
@@ -2397,6 +2577,8 @@ addEventListener("dragenter", e => { e.preventDefault(); dragN++; document.body.
 addEventListener("dragleave", e => { if (--dragN <= 0){ dragN = 0; document.body.classList.remove("dragging"); } });
 addEventListener("dragover", e => e.preventDefault());
 addEventListener("drop", e => { e.preventDefault(); dragN = 0; document.body.classList.remove("dragging"); upload(e.dataTransfer.files); });
+addEventListener("pagehide", () => { try { navigator.sendBeacon("/api/bye?t=" + TOKEN); } catch(e){} });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && S) refresh(true); });
 const DEFAULTS = __DEFAULTS__;
 refresh();
 </script>
@@ -2413,11 +2595,17 @@ def main() -> None:
     p.add_argument("--batch", action="store_true", help="Convertir input/ sans interface")
     p.add_argument("--force", action="store_true", help="(batch) Refaire les vidéos existantes")
     p.add_argument("--no-browser", action="store_true", help="Ne pas ouvrir le navigateur")
+    p.add_argument("--app", action="store_true",
+                   help="Mode application (sans terminal) : journal dans onde2vid.log, "
+                        "arrêt automatique quand l'onglet est fermé")
     args = p.parse_args()
     if args.batch:
         run_batch(args.force)
     else:
-        run_gui(open_browser=not args.no_browser)
+        app_mode = args.app or sys.stdout is None      # pythonw (Windows) = pas de console
+        if app_mode:
+            start_log()
+        run_gui(open_browser=not args.no_browser, app_mode=app_mode)
 
 
 if __name__ == "__main__":
