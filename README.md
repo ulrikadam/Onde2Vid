@@ -25,7 +25,29 @@ Avec Onde2Vid, vous pouvez :
 - prévisualiser un extrait avant de lancer la conversion complète ;
 - convertir tout le dossier en mode batch, sans interface.
 
+## Version autonome (sans Python)
+
+Des versions prêtes à l’emploi, avec FFmpeg inclus, sont publiées dans les [Releases](https://github.com/ulrikadam/Onde2Vid/releases) : rien d’autre à installer.
+
+| Système | Fichier | Lancement |
+|---|---|---|
+| Windows | `Onde2Vid-…-Windows.zip` | décompressez, puis double-cliquez sur `Onde2Vid.exe` |
+| macOS (Apple Silicon : M1 et suivants) | `Onde2Vid-…-macOS-AppleSilicon.zip` | décompressez, puis double-cliquez sur `Onde2Vid.app` (vous pouvez la glisser dans Applications) |
+| macOS (Intel) | `Onde2Vid-…-macOS-Intel.zip` | idem |
+| Linux | `Onde2Vid-…-Linux.tar.gz` | décompressez, puis lancez `Onde2Vid` |
+
+Ces versions ne sont pas signées par Apple ni par Microsoft. À la première ouverture :
+
+- **macOS** : si le Mac refuse d’ouvrir l’app, allez dans *Réglages Système → Confidentialité et sécurité* et cliquez sur « Ouvrir quand même » ;
+- **Windows** : si SmartScreen affiche « Windows a protégé votre ordinateur », cliquez sur « Informations complémentaires », puis « Exécuter quand même ».
+
+La version autonome range vos fichiers dans le dossier `Documents/Onde2Vid` (sous-dossiers `input/` et `output/`).
+
+Pour publier une nouvelle version, créez une étiquette `v…` (par exemple `git tag v1.0.0` puis `git push --tags`) : GitHub fabrique alors les quatre versions et les joint à une Release.
+
 ## Prérequis
+
+Pour utiliser directement le script Python (au lieu de la version autonome) :
 
 - Python 3.9 ou une version plus récente
 - [FFmpeg](https://ffmpeg.org/), avec l’encodeur vidéo `libx264`

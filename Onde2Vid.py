@@ -56,14 +56,22 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+APP_NAME = "Onde2Vid"
+FROZEN = bool(getattr(sys, "frozen", False))        # version autonome (sans Python)
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))   # fichiers fournis
+if os.environ.get("ONDE2VID_DIR"):                  # dossier de travail choisi à la main
+    SCRIPT_DIR = Path(os.environ["ONDE2VID_DIR"]).expanduser()
+elif FROZEN:                                        # version autonome : Documents/Onde2Vid
+    _docs = Path.home() / "Documents"
+    SCRIPT_DIR = (_docs if _docs.is_dir() else Path.home()) / APP_NAME
+else:                                               # script Python : tout à côté du script
+    SCRIPT_DIR = Path(__file__).resolve().parent
 INPUT_DIR = SCRIPT_DIR / "input"
 COVER_DIR = INPUT_DIR / "jaquettes"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 SETTINGS_FILE = SCRIPT_DIR / "reglages.json"
-TMP = Path(tempfile.mkdtemp(prefix="mp3mp4_"))
+TMP = Path(tempfile.mkdtemp(prefix="onde2vid_"))
 
-APP_NAME = "Onde2Vid"
 LOGO_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
     '<defs><linearGradient id="o2v" gradientUnits="userSpaceOnUse" x1="12" y1="0" x2="89" y2="0">'
@@ -177,11 +185,12 @@ def prepare_local_binary(path: Path) -> None:
 
 
 def find_ffmpeg() -> str | None:
-    for name in ("ffmpeg", "ffmpeg.exe"):
-        local = SCRIPT_DIR / name
-        if local.is_file():
-            prepare_local_binary(local)
-            return str(local)
+    for folder in ([BUNDLE_DIR] if FROZEN else []) + [SCRIPT_DIR, BUNDLE_DIR]:
+        for name in ("ffmpeg", "ffmpeg.exe"):
+            local = folder / name
+            if local.is_file():
+                prepare_local_binary(local)
+                return str(local)
     found = shutil.which("ffmpeg")
     if found:
         return found
@@ -1537,9 +1546,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._host_ok():
             return self._send(403, b"Forbidden", "text/plain")
-        ACTIVITY["seen"] = time.monotonic()
         url = urlparse(self.path)
         q = parse_qs(url.query)
+        if url.path != "/api/ping":        # les vérifications d'un 2e lancement ne comptent pas
+            ACTIVITY["seen"] = time.monotonic()
         if url.path == "/api/ping":
             self._json({"app": APP_NAME})
         elif url.path == "/":
@@ -1748,14 +1758,14 @@ def _bash_inner(s: str) -> str:
 
 def mac_app() -> bool:
     """Onde2Vid.app : une vraie application Mac (icône, pas de Terminal). True si elle vient d'être créée."""
-    app = SCRIPT_DIR / f"{APP_NAME}.app"
+    app = BUNDLE_DIR / f"{APP_NAME}.app"
     new = not app.exists()
     c = app / "Contents"
     launcher = (MAC_LAUNCHER.replace("__SCRIPT__", _bash_inner(str(Path(__file__).resolve())))
                 .replace("__PYTHON__", _bash_inner(sys.executable or "")))
     changed = _write_if_changed(c / "MacOS" / APP_NAME, launcher, 0o755)
     changed |= _write_if_changed(c / "Info.plist", MAC_PLIST)
-    icon, dst = SCRIPT_DIR / "assets" / "icon.icns", c / "Resources" / "icon.icns"
+    icon, dst = BUNDLE_DIR / "assets" / "icon.icns", c / "Resources" / "icon.icns"
     if icon.is_file() and (not dst.is_file() or dst.stat().st_size != icon.stat().st_size):
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(icon, dst)
@@ -1771,12 +1781,16 @@ def windows_shortcut() -> bool:
     lnk = progs / f"{APP_NAME}.lnk"
     if not progs.is_dir() or lnk.exists():
         return False
-    exe = Path(sys.executable)
-    target = exe.with_name("pythonw.exe") if exe.with_name("pythonw.exe").is_file() else exe
-    icon = SCRIPT_DIR / "assets" / "icon.ico"
-    env = dict(os.environ, O2V_LNK=str(lnk), O2V_TARGET=str(target),
-               O2V_ARGS=f'"{Path(__file__).resolve()}" --app', O2V_DIR=str(SCRIPT_DIR),
-               O2V_ICON=f"{icon if icon.is_file() else target},0")
+    if FROZEN:                             # Onde2Vid.exe contient déjà l'icône
+        target, args, icon = Path(sys.executable), "", f"{sys.executable},0"
+    else:
+        exe = Path(sys.executable)
+        target = exe.with_name("pythonw.exe") if exe.with_name("pythonw.exe").is_file() else exe
+        args = f'"{Path(__file__).resolve()}" --app'
+        ico = BUNDLE_DIR / "assets" / "icon.ico"
+        icon = f"{ico if ico.is_file() else target},0"
+    env = dict(os.environ, O2V_LNK=str(lnk), O2V_TARGET=str(target), O2V_ARGS=args,
+               O2V_DIR=str(target.parent if FROZEN else BUNDLE_DIR), O2V_ICON=icon)
     ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:O2V_LNK);"
           "$s.TargetPath=$env:O2V_TARGET;$s.Arguments=$env:O2V_ARGS;"
           "$s.WorkingDirectory=$env:O2V_DIR;$s.IconLocation=$env:O2V_ICON;"
@@ -1786,13 +1800,13 @@ def windows_shortcut() -> bool:
     return lnk.exists()
 
 
-def linux_desktop_entry(python: str, script: Path, icon: Path | None) -> str:
+def linux_desktop_entry(python: str, script: Path | None, icon: Path | None) -> str:
     def q(s) -> str:                       # règles de guillemets des fichiers .desktop
         s = str(s).replace("\\", "\\\\\\\\")
         return '"' + re.sub(r'(["`$])', r"\\\1", s) + '"'
     lines = ["[Desktop Entry]", "Type=Application", f"Name={APP_NAME}",
              "Comment=Transformer des MP3 en vidéos animées",
-             f"Exec={q(python)} {q(script)} --app", "Terminal=false",
+             f"Exec={q(python)} {q(script) + ' ' if script else ''}--app", "Terminal=false",
              "Categories=AudioVideo;Audio;Video;"]
     if icon:
         lines.append(f"Icon={icon}")
@@ -1804,8 +1818,8 @@ def linux_desktop() -> bool:
     base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     p = base / "applications" / "onde2vid.desktop"
     new = not p.exists()
-    icon = SCRIPT_DIR / "assets" / "icon.png"
-    _write_if_changed(p, linux_desktop_entry(sys.executable, Path(__file__).resolve(),
+    icon = BUNDLE_DIR / "assets" / "icon.png"
+    _write_if_changed(p, linux_desktop_entry(sys.executable, None if FROZEN else Path(__file__).resolve(),
                                              icon if icon.is_file() else None), 0o755)
     return new
 
@@ -1813,7 +1827,7 @@ def linux_desktop() -> bool:
 def make_launcher() -> None:
     """Crée (ou met à jour) le raccourci qui lance Onde2Vid sans terminal."""
     try:
-        if sys.platform == "darwin" and mac_app():
+        if sys.platform == "darwin" and not FROZEN and mac_app():
             print(f"➜ {APP_NAME}.app a été créé dans le dossier : la prochaine fois, double-clique "
                   "dessus (tu peux aussi le glisser dans le Dock).")
         elif sys.platform == "win32" and windows_shortcut():
@@ -1855,6 +1869,7 @@ def start_log() -> None:
     """Mode application (sans terminal) : les messages vont dans onde2vid.log."""
     log = SCRIPT_DIR / "onde2vid.log"
     try:
+        SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
         if log.exists() and log.stat().st_size > 1_000_000:
             log.unlink()
         fh = open(log, "a", encoding="utf-8", buffering=1)
@@ -2598,14 +2613,29 @@ def main() -> None:
     p.add_argument("--app", action="store_true",
                    help="Mode application (sans terminal) : journal dans onde2vid.log, "
                         "arrêt automatique quand l'onglet est fermé")
-    args = p.parse_args()
+    p.add_argument("--server", action="store_true", help=argparse.SUPPRESS)
+    args, _ = p.parse_known_args()       # macOS peut ajouter ses propres arguments
     if args.batch:
         run_batch(args.force)
-    else:
-        app_mode = args.app or sys.stdout is None      # pythonw (Windows) = pas de console
-        if app_mode:
-            start_log()
-        run_gui(open_browser=not args.no_browser, app_mode=app_mode)
+        return
+    if FROZEN and sys.platform == "darwin" and not args.server:
+        # L'app Mac lance le serveur à part puis se ferme : un nouveau double-clic
+        # relance alors l'app, qui retrouve simplement l'onglet déjà ouvert.
+        ensure_tools()
+        url = find_running()
+        if url:
+            if not args.no_browser:
+                webbrowser.open(url)
+        else:
+            subprocess.Popen([sys.executable, "--server"] + (["--no-browser"] if args.no_browser else []),
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        shutil.rmtree(TMP, ignore_errors=True)
+        return
+    app_mode = args.app or args.server or FROZEN or sys.stdout is None   # pas de console
+    if app_mode:
+        start_log()
+    run_gui(open_browser=not args.no_browser, app_mode=app_mode)
 
 
 if __name__ == "__main__":

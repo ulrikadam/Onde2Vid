@@ -1,0 +1,148 @@
+# Fabrique les versions autonomes d'Onde2Vid (sans Python, avec FFmpeg inclus)
+# pour Windows, Linux et macOS (Intel et Apple Silicon).
+#
+# - À chaque étiquette « v… » (ex. git tag v1.0.0 && git push --tags) :
+#   les fichiers sont publiés dans une nouvelle « Release » GitHub.
+# - Bouton « Run workflow » (onglet Actions) : fabrication de test,
+#   fichiers téléchargeables dans le résumé de l'exécution.
+
+name: Versions autonomes
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: Windows,            icon: assets/icon.ico,  sep: ";" }
+          - { os: ubuntu-22.04,   name: Linux,              icon: "",               sep: ":" }
+          - { os: macos-15-intel, name: macOS-Intel,        icon: assets/icon.icns, sep: ":" }
+          - { os: macos-14,       name: macOS-AppleSilicon, icon: assets/icon.icns, sep: ":" }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Télécharger FFmpeg (version statique, avec libx264)
+        run: |
+          set -euo pipefail
+          mkdir -p ffbin
+          case "${{ matrix.name }}" in
+            Windows)
+              FFURL=https://github.com/BtbN/FFmpeg-Builds/releases
+              curl -fsSL -o ff.zip "$FFURL/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+              unzip -q -j ff.zip '*/bin/ffmpeg.exe' -d ffbin ;;
+            Linux)
+              FFURL=https://github.com/BtbN/FFmpeg-Builds/releases
+              curl -fsSL -o ff.tar.xz "$FFURL/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+              tar -xJf ff.tar.xz --wildcards --strip-components=2 -C ffbin '*/bin/ffmpeg' ;;
+            macOS-Intel)
+              FFURL=https://evermeet.cx/ffmpeg/
+              curl -fsSL -o ff.zip https://evermeet.cx/ffmpeg/getrelease/zip
+              unzip -q -j ff.zip -d ffbin ;;
+            macOS-AppleSilicon)
+              FFURL=https://ffmpeg.martin-riedl.de/
+              curl -fsSL -o ff.zip https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip
+              unzip -q -j ff.zip -d ffbin ;;
+          esac
+          FF=$(ls ffbin/ffmpeg ffbin/ffmpeg.exe 2>/dev/null | head -1)
+          chmod +x "$FF"
+          if [ "$RUNNER_OS" = "macOS" ]; then codesign --force -s - "$FF"; fi
+          "$FF" -hide_banner -version | head -1
+          "$FF" -hide_banner -encoders | grep -q libx264 || { echo "Ce FFmpeg n'a pas libx264"; exit 1; }
+          echo "FF=$FF" >> "$GITHUB_ENV"
+          echo "FFURL=$FFURL" >> "$GITHUB_ENV"
+
+      - name: Construire Onde2Vid
+        run: |
+          set -euo pipefail
+          ICON=()
+          if [ -n "${{ matrix.icon }}" ]; then ICON=(--icon "${{ matrix.icon }}"); fi
+          pyinstaller --noconfirm --clean --windowed --name Onde2Vid "${ICON[@]}" \
+            --add-binary "$FF${{ matrix.sep }}." \
+            --add-data "assets/icon.png${{ matrix.sep }}assets" \
+            --osx-bundle-identifier io.github.ulrikadam.onde2vid \
+            Onde2Vid.py
+
+      - name: Finaliser l'application Mac
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VERSION="0.0.0"
+          PLIST=dist/Onde2Vid.app/Contents/Info.plist
+          plutil -replace LSUIElement -bool true "$PLIST"
+          plutil -replace CFBundleDisplayName -string Onde2Vid "$PLIST"
+          plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
+          codesign --force --deep -s - dist/Onde2Vid.app
+
+      - name: Emballer
+        run: |
+          set -euo pipefail
+          VERSION="$GITHUB_REF_NAME"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VERSION="test"
+          mkdir -p pkg/Onde2Vid
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            ditto dist/Onde2Vid.app pkg/Onde2Vid/Onde2Vid.app
+          else
+            cp -R dist/Onde2Vid/. pkg/Onde2Vid/
+          fi
+          cp LICENSE pkg/Onde2Vid/LICENSE.txt
+          {
+            echo "Onde2Vid inclut FFmpeg (https://ffmpeg.org), un logiciel libre sous licence GNU GPL."
+            echo "Il est fourni sans modification, pour qu'Onde2Vid fonctionne sans rien installer."
+            echo "Provenance de ce binaire : $FFURL"
+            echo "Code source de FFmpeg : https://ffmpeg.org/download.html"
+          } > pkg/Onde2Vid/FFmpeg-LISEZMOI.txt
+          OUT="Onde2Vid-$VERSION-${{ matrix.name }}"
+          cd pkg
+          case "$RUNNER_OS" in
+            macOS)   ditto -c -k --keepParent Onde2Vid "../$OUT.zip" ;;
+            Windows) python -m zipfile -c "../$OUT.zip" Onde2Vid ;;
+            Linux)   tar -czf "../$OUT.tar.gz" Onde2Vid ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Onde2Vid-${{ matrix.name }}
+          path: |
+            Onde2Vid-*.zip
+            Onde2Vid-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publier la version
+    needs: build
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: Créer la Release GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la out
+          gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
+            --title "Onde2Vid $GITHUB_REF_NAME" --generate-notes

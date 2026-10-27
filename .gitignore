@@ -68,3 +68,6 @@ Onde2Vid.bat
 # Créés au lancement
 Onde2Vid.app/
 onde2vid.log
+
+# Fabrication des versions autonomes (PyInstaller)
+*.spec
