@@ -141,6 +141,7 @@ DEFAULTS = {
     "fps": 30,
     "crf": 20,                # qualité vidéo (plus bas = meilleur)
     "preset": "veryfast",     # vitesse d'encodage
+    "compression": "fast",    # fast : puce graphique si possible ; compact : processeur (libx264)
     "audio_kbps": 320,
 }
 
@@ -327,6 +328,7 @@ def clean_settings(raw) -> dict:
     s["fps"] = _pick(s["fps"], [24, 25, 30, 50, 60], 30)
     s["crf"] = _pick(s["crf"], [14, 17, 20, 23], 20)
     s["preset"] = _pick(s["preset"], ["veryfast", "medium", "slow"], "veryfast")
+    s["compression"] = _pick(s["compression"], ["fast", "compact"], "fast")
     s["audio_kbps"] = _pick(s["audio_kbps"], [192, 256, 320], 320)
     return s
 
@@ -1331,33 +1333,39 @@ def _inputs(g: Graph) -> list[str]:
 
 
 _HW: dict = {}
+_HW_LOCK = threading.Lock()
 
 
 def hw_encoder() -> str | None:
     """Encodeur H.264 de la puce graphique s'il fonctionne vraiment (ONDE2VID_HWENC=0 pour l'ignorer)."""
     if os.environ.get("ONDE2VID_HWENC", "").strip() == "0":
         return None
-    if "enc" not in _HW:
-        _HW["enc"] = None
-        ff = TOOLS["ffmpeg"]
+    ff = TOOLS["ffmpeg"]
+    if not ff:
+        return None
+    with _HW_LOCK:                         # un seul test, même si plusieurs requêtes arrivent
+        if "enc" in _HW:
+            return _HW["enc"]
+        enc_found = None
         cands = ["h264_videotoolbox"] if sys.platform == "darwin" else []
         try:
-            listed = run_text([ff, "-hide_banner", "-encoders"]).stdout if ff else ""
+            listed = run_text([ff, "-hide_banner", "-encoders"]).stdout
             for enc in cands:
                 if enc in listed and run_text(
                         [ff, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
                          "color=s=640x360:r=30:d=0.5", "-c:v", enc, "-b:v", "1M", "-f", "null", "-"]
                         ).returncode == 0:
-                    _HW["enc"] = enc
+                    enc_found = enc
                     break
         except (OSError, subprocess.SubprocessError):
             pass
-    return _HW["enc"]
+        _HW["enc"] = enc_found
+        return enc_found
 
 
 def video_args(s: dict, W: int, H: int) -> list[str]:
-    """Réglages de compression vidéo : puce graphique si possible, sinon libx264."""
-    enc = hw_encoder()
+    """Réglages de compression vidéo : puce graphique (mode Rapide) si possible, sinon libx264."""
+    enc = hw_encoder() if s["compression"] == "fast" else None
     if enc == "h264_videotoolbox":
         # débit adapté à la taille de l'image (≈ 1,5 Mb/s en 1080p à 30 i/s), CRF 18 → +25 %
         kbps = int(W * H * s["fps"] * 0.025 / 1000 * (1.25 ** ((20 - s["crf"]) / 2)))
@@ -1370,13 +1378,13 @@ PARALLEL_MIN = 120.0      # morceaux plus courts : conversion d'un seul tenant
 SEGMENT_TARGET = 240.0    # durée visée de chaque partie, en secondes
 
 
-def parallel_workers(W: int, H: int) -> int:
+def parallel_workers(s: dict, W: int, H: int) -> int:
     """Nombre de parties calculées en même temps (ONDE2VID_PARALLEL=n pour forcer)."""
     forced = os.environ.get("ONDE2VID_PARALLEL", "").strip()
     if forced.isdigit():
         return max(1, int(forced))
     n = max(1, (os.cpu_count() or 2) // 2)
-    if hw_encoder():                       # la puce graphique devient la limite : 2 parties suffisent
+    if s["compression"] == "fast" and hw_encoder():   # la puce graphique devient la limite : 2 parties suffisent
         n = min(n, 2)
     if W * H > 4_000_000:                  # 4K : chaque partie demande beaucoup de mémoire
         n = min(n, 3)
@@ -1523,7 +1531,7 @@ def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) 
     if on_progress:
         on_progress(0, "préparation…")
     W, H = frame_size(s)
-    workers = parallel_workers(W, H)
+    workers = parallel_workers(s, W, H)
     if dur >= PARALLEL_MIN and workers > 1:
         return convert_parallel(mp3, s, out, dur, workers, on_progress, set_proc)
     g = prepare(mp3, s, W, H, 0.0, dur, final=True)
@@ -1680,7 +1688,7 @@ def app_state() -> dict:
                       "tag": f"{info['artist']} – {info['title']}".strip(" –") if info["title"] else "",
                       "done": (OUTPUT_DIR / (f.stem + ".mp4")).exists()})
     return {"files": files, "images": list_images(), "jobs": QUEUE.snapshot(),
-            "running": QUEUE.running, "ffmpeg": TOOLS["ffmpeg"], "x264": TOOLS["x264"],
+            "running": QUEUE.running, "ffmpeg": TOOLS["ffmpeg"], "x264": TOOLS["x264"], "hw": bool(hw_encoder()),
             "title_ok": title_ok(), "settings": SETTINGS,
             "input": str(INPUT_DIR), "output": str(OUTPUT_DIR)}
 
@@ -2428,8 +2436,10 @@ input[type=range]{width:100%;accent-color:var(--accent)}
             <div>
               <div class="row"><label>Qualité vidéo</label>
                 <select data-k="crf"><option value="23">Standard</option><option value="20">Haute</option><option value="17">Très haute</option><option value="14">Maximale (gros fichiers)</option></select></div>
-              <div class="row"><label>Vitesse d'encodage</label>
-                <select data-k="preset"><option value="veryfast">Rapide</option><option value="medium">Équilibrée</option><option value="slow">Lente (fichier plus léger)</option></select></div>
+              <div class="row"><label>Compression</label>
+                <select data-k="compression"><option value="fast" id="hwOpt">Rapide (puce graphique, fichiers plus gros)</option><option value="compact">Compacte (processeur, fichiers plus petits)</option></select></div>
+              <div class="row" id="presetRow"><label>Vitesse (mode compact)</label>
+                <select data-k="preset"><option value="veryfast">Normale</option><option value="medium">Équilibrée</option><option value="slow">Lente (fichier plus léger)</option></select></div>
               <div class="row"><label>Audio</label>
                 <select data-k="audio_kbps"><option value="192">AAC 192 kb/s</option><option value="256">AAC 256 kb/s</option><option value="320">AAC 320 kb/s</option></select></div>
             </div>
@@ -2746,6 +2756,8 @@ function renderStatus(){
     w.style.display = "";
     $("#warnBox").textContent = "Ce ffmpeg ne contient pas l'encodeur H.264 (libx264). Télécharge une autre version de ffmpeg.";
   } else w.style.display = "none";
+  $("#hwOpt").textContent = S.hw ? "Rapide (puce graphique, fichiers plus gros)"
+                                 : "Rapide (puce graphique indisponible ici : processeur)";
   $("#titleSel").disabled = !S.title_ok;
   $("#titleWarn").hidden = !!S.title_ok;
 }
