@@ -31,6 +31,9 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Signature + notarisation Apple : actives seulement si les secrets sont configurés
+      HAS_APPLE_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -72,11 +75,36 @@ jobs:
           echo "FF=$FF" >> "$GITHUB_ENV"
           echo "FFURL=$FFURL" >> "$GITHUB_ENV"
 
+      - name: Importer le certificat Apple (Developer ID)
+        if: runner.os == 'macOS' && env.HAS_APPLE_CERT == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KC="$RUNNER_TEMP/signature.keychain-db"
+          KCPW=$(openssl rand -hex 16)
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificat.p12"
+          security import "$RUNNER_TEMP/certificat.p12" -k "$KC" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/certificat.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPW" "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"')
+          [ -n "$IDENTITY" ] || { echo "Aucun certificat « Developer ID Application » dans MACOS_CERTIFICATE"; exit 1; }
+          echo "Signature avec : $IDENTITY"
+          echo "MACOS_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
       - name: Construire Onde2Vid
         run: |
           set -euo pipefail
           ICON=()
           if [ -n "${{ matrix.icon }}" ]; then ICON=(--icon "${{ matrix.icon }}"); fi
+          if [ -n "${MACOS_IDENTITY:-}" ]; then
+            ICON+=(--codesign-identity "$MACOS_IDENTITY" --osx-entitlements-file assets/entitlements.plist)
+          fi
           pyinstaller --noconfirm --clean --windowed --name Onde2Vid "${ICON[@]}" \
             --add-binary "$FF${{ matrix.sep }}." \
             --add-data "assets/icon.png${{ matrix.sep }}assets" \
@@ -93,7 +121,38 @@ jobs:
           plutil -replace LSUIElement -bool true "$PLIST"
           plutil -replace CFBundleDisplayName -string Onde2Vid "$PLIST"
           plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
-          codesign --force --deep -s - dist/Onde2Vid.app
+          APP=dist/Onde2Vid.app
+          if [ -n "${MACOS_IDENTITY:-}" ]; then      # signature Developer ID (de l'intérieur vers l'extérieur)
+            codesign --force --options runtime --timestamp -s "$MACOS_IDENTITY" "$APP/Contents/Frameworks/ffmpeg"
+            codesign --force --options runtime --timestamp --entitlements assets/entitlements.plist \
+              -s "$MACOS_IDENTITY" "$APP"
+            codesign --verify --deep --strict --verbose=2 "$APP"
+          else                                       # sans certificat : signature « ad hoc »
+            codesign --force --deep -s - "$APP"
+          fi
+
+      - name: Notariser auprès d'Apple
+        if: runner.os == 'macOS' && env.MACOS_IDENTITY != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          AUTH=(--apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID")
+          ditto -c -k --keepParent dist/Onde2Vid.app notarisation.zip
+          xcrun notarytool submit notarisation.zip "${AUTH[@]}" --wait --timeout 30m \
+            --output-format json > notarisation.json || true
+          cat notarisation.json; echo
+          STATUS=$(python -c "import json; print(json.load(open('notarisation.json')).get('status', ''))" || true)
+          if [ "$STATUS" != "Accepted" ]; then
+            ID=$(python -c "import json; print(json.load(open('notarisation.json')).get('id', ''))" || true)
+            if [ -n "$ID" ]; then xcrun notarytool log "$ID" "${AUTH[@]}"; fi
+            echo "La notarisation a échoué (statut : ${STATUS:-inconnu})"; exit 1
+          fi
+          xcrun stapler staple dist/Onde2Vid.app
+          spctl -a -vv dist/Onde2Vid.app
+          rm -f notarisation.zip notarisation.json
 
       - name: Emballer
         run: |

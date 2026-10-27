@@ -45,6 +45,8 @@ La version autonome range vos fichiers dans le dossier `Documents/Onde2Vid` (sou
 
 Pour publier une nouvelle version, créez une étiquette `v…` (par exemple `git tag v1.0.0` puis `git push --tags`) : GitHub fabrique alors les quatre versions et les joint à une Release.
 
+Les versions Mac sont signées et notarisées par Apple (plus aucun blocage à l’ouverture) quand ces secrets sont configurés dans le dépôt (*Settings → Secrets and variables → Actions*) : `MACOS_CERTIFICATE` (certificat « Developer ID Application » exporté en .p12, encodé en base64), `MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_APP_PASSWORD` (mot de passe pour app) et `APPLE_TEAM_ID`.
+
 ## Prérequis
 
 Pour utiliser directement le script Python (au lieu de la version autonome) :
