@@ -55,15 +55,16 @@ jobs:
               curl -fsSL -o ff.tar.xz "$FFURL/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
               tar -xJf ff.tar.xz --wildcards --strip-components=2 -C ffbin '*/bin/ffmpeg' ;;
             macOS-Intel)
-              FFURL=https://evermeet.cx/ffmpeg/
-              curl -fsSL -o ff.zip https://evermeet.cx/ffmpeg/getrelease/zip
+              FFURL=https://ffmpeg.martin-riedl.de/
+              curl -fsSL -o ff.zip https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffmpeg.zip
               unzip -q -j ff.zip -d ffbin ;;
             macOS-AppleSilicon)
               FFURL=https://ffmpeg.martin-riedl.de/
               curl -fsSL -o ff.zip https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip
               unzip -q -j ff.zip -d ffbin ;;
           esac
-          FF=$(ls ffbin/ffmpeg ffbin/ffmpeg.exe 2>/dev/null | head -1)
+          if [ "$RUNNER_OS" = "Windows" ]; then FF=ffbin/ffmpeg.exe; else FF=ffbin/ffmpeg; fi
+          [ -f "$FF" ] || { echo "FFmpeg introuvable après le téléchargement"; ls -la ffbin; exit 1; }
           chmod +x "$FF"
           if [ "$RUNNER_OS" = "macOS" ]; then codesign --force -s - "$FF"; fi
           "$FF" -hide_banner -version | head -1
