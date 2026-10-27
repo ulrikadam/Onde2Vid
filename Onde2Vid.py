@@ -1330,6 +1330,42 @@ def _inputs(g: Graph) -> list[str]:
     return out
 
 
+_HW: dict = {}
+
+
+def hw_encoder() -> str | None:
+    """Encodeur H.264 de la puce graphique s'il fonctionne vraiment (ONDE2VID_HWENC=0 pour l'ignorer)."""
+    if os.environ.get("ONDE2VID_HWENC", "").strip() == "0":
+        return None
+    if "enc" not in _HW:
+        _HW["enc"] = None
+        ff = TOOLS["ffmpeg"]
+        cands = ["h264_videotoolbox"] if sys.platform == "darwin" else []
+        try:
+            listed = run_text([ff, "-hide_banner", "-encoders"]).stdout if ff else ""
+            for enc in cands:
+                if enc in listed and run_text(
+                        [ff, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                         "color=s=640x360:r=30:d=0.5", "-c:v", enc, "-b:v", "1M", "-f", "null", "-"]
+                        ).returncode == 0:
+                    _HW["enc"] = enc
+                    break
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _HW["enc"]
+
+
+def video_args(s: dict, W: int, H: int) -> list[str]:
+    """Réglages de compression vidéo : puce graphique si possible, sinon libx264."""
+    enc = hw_encoder()
+    if enc == "h264_videotoolbox":
+        # débit adapté à la taille de l'image (≈ 1,5 Mb/s en 1080p à 30 i/s), CRF 18 → +25 %
+        kbps = int(W * H * s["fps"] * 0.025 / 1000 * (1.25 ** ((20 - s["crf"]) / 2)))
+        return ["-c:v", enc, "-b:v", f"{kbps}k", "-prio_speed", "1", "-profile:v", "high",
+                "-r", str(s["fps"])]
+    return ["-c:v", "libx264", "-preset", s["preset"], "-crf", str(s["crf"]), "-r", str(s["fps"])]
+
+
 PARALLEL_MIN = 120.0      # morceaux plus courts : conversion d'un seul tenant
 SEGMENT_TARGET = 240.0    # durée visée de chaque partie, en secondes
 
@@ -1340,6 +1376,8 @@ def parallel_workers(W: int, H: int) -> int:
     if forced.isdigit():
         return max(1, int(forced))
     n = max(1, (os.cpu_count() or 2) // 2)
+    if hw_encoder():                       # la puce graphique devient la limite : 2 parties suffisent
+        n = min(n, 2)
     if W * H > 4_000_000:                  # 4K : chaque partie demande beaucoup de mémoire
         n = min(n, 3)
     return min(n, 8)
@@ -1438,8 +1476,8 @@ def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
             cmd += ["-ss", f"{start - pre:.6f}"]
         cmd += ["-t", f"{length + pre + 1:.6f}", "-i", str(mp3), *_inputs(g),
                 "-filter_complex", g.text(), "-map", "[v]", "-an",
-                "-c:v", "libx264", "-preset", s["preset"], "-crf", str(s["crf"]), "-r", str(fps),
-                "-threads", threads, "-frames:v", str(b - a), str(work / f"partie{k:03d}.mp4")]
+                *video_args(s, W, H), "-threads", threads,
+                "-frames:v", str(b - a), str(work / f"partie{k:03d}.mp4")]
         _run_ff(cmd, group, lambda sec: progress(k, min(length, sec)))
         progress(k, length)
 
@@ -1496,8 +1534,7 @@ def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) 
            "-i", str(mp3), *_inputs(g),
            "-filter_complex", g.text(),
            "-map", "[v]", "-map", "0:a",
-           "-c:v", "libx264", "-preset", s["preset"], "-crf", str(s["crf"]), "-r", str(s["fps"]),
-           "-c:a", "aac", "-b:a", f"{s['audio_kbps']}k"]
+           *video_args(s, W, H), "-c:a", "aac", "-b:a", f"{s['audio_kbps']}k"]
     if dur:
         cmd += ["-t", f"{dur + 1:.3f}"]
     cmd += ["-shortest", "-movflags", "+faststart", str(part)]
