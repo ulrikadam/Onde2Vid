@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-mp3_to_mp4.py — Convertit des MP3 en vidéos MP4 avec visualiseur, prêtes pour YouTube.
+Onde2Vid — transforme des MP3 en vidéos MP4 animées (visualiseur), prêtes pour YouTube.
+https://github.com/ulrikadam/Onde2Vid — licence GNU GPL v3.0
 
-  python3 mp3_to_mp4.py            → ouvre l'interface dans le navigateur
-  python3 mp3_to_mp4.py --batch    → convertit tout input/ sans interface
-                                     (avec les derniers réglages enregistrés)
-  python3 mp3_to_mp4.py --batch --force   → reconvertit aussi ce qui existe déjà
+  python3 Onde2Vid.py            → ouvre l'interface dans le navigateur
+  python3 Onde2Vid.py --batch    → convertit tout input/ sans interface
+                                   (avec les derniers réglages enregistrés)
+  python3 Onde2Vid.py --batch --force   → reconvertit aussi ce qui existe déjà
 
 Dossiers (à côté du script, créés automatiquement) :
   input/            tes MP3 (+ images de fond éventuelles)
@@ -44,7 +45,7 @@ import webbrowser
 from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -56,6 +57,24 @@ COVER_DIR = INPUT_DIR / "jaquettes"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 SETTINGS_FILE = SCRIPT_DIR / "reglages.json"
 TMP = Path(tempfile.mkdtemp(prefix="mp3mp4_"))
+
+APP_NAME = "Onde2Vid"
+LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+    '<defs><linearGradient id="o2v" gradientUnits="userSpaceOnUse" x1="12" y1="0" x2="89" y2="0">'
+    '<stop offset="0" stop-color="#00e8ff"/><stop offset=".35" stop-color="#168dff"/>'
+    '<stop offset=".7" stop-color="#a33dff"/><stop offset="1" stop-color="#ff2bf1"/>'
+    '</linearGradient></defs>'
+    '<rect width="100" height="100" rx="24" fill="#080a17"/>'
+    '<g fill="url(#o2v)" stroke="url(#o2v)">'
+    '<rect x="13" y="34" width="10.4" height="33" rx="5.2" stroke="none"/>'
+    '<rect x="26.2" y="19.8" width="10.4" height="60.6" rx="5.2" stroke="none"/>'
+    '<rect x="39.3" y="28.2" width="10.4" height="45.4" rx="5.2" stroke="none"/>'
+    '<rect x="52.5" y="38.1" width="10.4" height="30" rx="5.2" stroke="none"/>'
+    '<rect x="65.6" y="44.6" width="9.2" height="19" rx="4.6" stroke="none"/>'
+    '<path d="M79.5 50 L79.5 59 L87 54.5 Z" stroke-width="3.2" stroke-linejoin="round"/>'
+    '</g></svg>'
+)
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 STYLES = ["circle", "retro", "mirror", "tunnel", "cubes", "aurora",
@@ -1077,7 +1096,7 @@ def layer_circle(g: Graph, L: dict, s: dict, fps: int):
 def layer_retro(g: Graph, L: dict, s: dict, fps: int):
     U, W, BH = L["U"], L["W"], L["vh"]
     BW = even(W * 0.92)
-    nb = max(12, min(64, int(BW / (U * 0.034))))
+    nb = max(12, min(64, int(BW / (U * 0.034)))) // 2 * 2   # showcqt veut une largeur paire
     SH = 120
     xm, ym, xc, yc = retro_maps(BW, BH, nb, SH, U)
     stops, vert = scheme_stops(s, L["cover"])
@@ -1089,7 +1108,7 @@ def layer_retro(g: Graph, L: dict, s: dict, fps: int):
 
 def layer_mirror(g: Graph, L: dict, s: dict, fps: int):
     U, W, BH = L["U"], L["W"], L["vh"]
-    nb = max(24, min(120, int(W / 2 / (U * 0.0105))))
+    nb = max(24, min(120, int(W / 2 / (U * 0.0105)))) // 2 * 2
     SH = 160
     xm, ym, xc, yc = mirror_maps(W, BH, nb, SH)
     stops, vert = scheme_stops(s, L["cover"])
@@ -1654,21 +1673,24 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_launcher() -> None:
-    """Crée un lanceur à double-cliquer à côté du script (une seule fois)."""
+    """Crée (ou répare) un lanceur à double-cliquer à côté du script."""
+    script = Path(__file__).name
+    if sys.platform == "darwin":
+        p = SCRIPT_DIR / f"{APP_NAME}.command"
+        body = f'#!/bin/bash\ncd "$(dirname "$0")"\n"{sys.executable}" "{script}"\n'
+    elif sys.platform == "win32":
+        p = SCRIPT_DIR / f"{APP_NAME}.bat"
+        body = f'@echo off\r\ncd /d "%~dp0"\r\n"{sys.executable}" "{script}"\r\n'
+    else:
+        return
     try:
+        if p.exists() and f'"{script}"' in p.read_text(encoding="utf-8", errors="replace"):
+            return
+        with open(p, "w", encoding="utf-8", newline="") as fh:
+            fh.write(body)
         if sys.platform == "darwin":
-            p = SCRIPT_DIR / "Convertisseur.command"
-            if not p.exists():
-                p.write_text(f'#!/bin/bash\ncd "$(dirname "$0")"\n"{sys.executable}" "{Path(__file__).name}"\n',
-                             encoding="utf-8")
-                p.chmod(0o755)
-                print("➜ Raccourci créé : la prochaine fois, double-clique sur « Convertisseur.command ».")
-        elif sys.platform == "win32":
-            p = SCRIPT_DIR / "Convertisseur.bat"
-            if not p.exists():
-                p.write_text(f'@echo off\r\ncd /d "%~dp0"\r\n"{sys.executable}" "{Path(__file__).name}"\r\n',
-                             encoding="utf-8")
-                print("➜ Raccourci créé : la prochaine fois, double-clique sur « Convertisseur.bat ».")
+            p.chmod(0o755)
+        print(f"➜ Raccourci créé : la prochaine fois, double-clique sur « {p.name} ».")
     except OSError:
         pass
 
@@ -1688,7 +1710,7 @@ def run_gui(open_browser: bool = True) -> None:
     port = SERVER.server_address[1]
     ALLOWED_HOSTS.update({f"127.0.0.1:{port}", f"localhost:{port}"})
     url = f"http://127.0.0.1:{port}/"
-    print(f"\n  Interface ouverte dans ton navigateur : {url}")
+    print(f"\n  {APP_NAME} — interface ouverte dans ton navigateur : {url}")
     print("  (laisse cette fenêtre ouverte ; Ctrl+C ou le bouton « Quitter » pour arrêter)\n")
     if not TOOLS["ffmpeg"]:
         print(f"  ⚠ FFmpeg introuvable : dépose le fichier 'ffmpeg' dans {SCRIPT_DIR}\n")
@@ -1746,20 +1768,21 @@ HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MP3 → MP4</title>
+<title>Onde2Vid</title>
+<link rel="icon" href="data:image/svg+xml,__FAVICON__">
 <style>
 :root{--bg:#f2f2f5;--panel:#fff;--panel2:#f6f6f9;--line:#e3e3ea;--text:#17171c;--muted:#6d6d79;
---accent:#ff3d3d;--accent2:#ff8a3d;--ok:#13a06a;--warn:#c98200;--err:#d42f48;--sel:rgba(255,61,61,.08);
+--accent:#6b5cff;--accent2:#ff3df5;--ok:#13a06a;--warn:#c98200;--err:#d42f48;--sel:rgba(107,92,255,.09);
 --shadow:0 1px 2px rgba(0,0,0,.04),0 6px 20px rgba(0,0,0,.04)}
 @media (prefers-color-scheme:dark){:root{--bg:#0d0d11;--panel:#16161c;--panel2:#1c1c23;--line:#292932;
---text:#ececf2;--muted:#8f8f9c;--sel:rgba(255,61,61,.13);--shadow:none}}
+--text:#ececf2;--muted:#8f8f9c;--sel:rgba(107,92,255,.16);--shadow:none}}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
 button,select,input{font:inherit;color:inherit}
 header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:14px;padding:12px 22px;background:color-mix(in srgb,var(--panel) 88%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
-.logo{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(135deg,var(--accent),var(--accent2));flex:none}
-.logo svg{width:20px;height:20px}
+.logo{width:38px;height:38px;flex:none}
+.logo svg{width:100%;height:100%;display:block}
 header h1{font-size:15.5px;margin:0;letter-spacing:-.01em}
 header .sub{font-size:12.5px;color:var(--muted)}
 .grow{flex:1}
@@ -1866,8 +1889,8 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 </head>
 <body>
 <header>
-  <div class="logo"><svg viewBox="0 0 24 24" fill="#fff"><rect x="3" y="10" width="3" height="8" rx="1"/><rect x="8" y="6" width="3" height="12" rx="1"/><rect x="13" y="3" width="3" height="15" rx="1"/><rect x="18" y="8" width="3" height="10" rx="1"/></svg></div>
-  <div><h1>MP3 → MP4</h1><div class="sub">Vidéos avec visualiseur pour YouTube</div></div>
+  <div class="logo">__LOGO__</div>
+  <div><h1>Onde2Vid</h1><div class="sub">Tes MP3 en vidéos animées pour YouTube</div></div>
   <div class="grow"></div>
   <span class="pill" id="ffpill"><span class="dot"></span><span id="fftext">…</span></span>
   <button class="btn ghost" id="quit">Quitter</button>
@@ -2045,7 +2068,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   <p class="hint err" id="cvErr"></p>
 </div></div>
 
-<div class="overlay" id="offline"><div><h3>Interface arrêtée</h3><p id="offMsg">Le programme ne répond plus. Relance <b>mp3_to_mp4.py</b> (ou « Convertisseur.command ») pour continuer.</p></div></div>
+<div class="overlay" id="offline"><div><h3>Interface arrêtée</h3><p id="offMsg">Le programme ne répond plus. Relance <b>Onde2Vid.py</b> (ou « Onde2Vid.command ») pour continuer.</p></div></div>
 
 <script>
 const TOKEN = "__TOKEN__";
@@ -2379,13 +2402,14 @@ refresh();
 </script>
 </body>
 </html>
-""".replace("__DEFAULTS__", json.dumps(DEFAULTS))
+""".replace("__DEFAULTS__", json.dumps(DEFAULTS)).replace("__LOGO__", LOGO_SVG).replace(
+    "__FAVICON__", quote(LOGO_SVG))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="MP3 → MP4 avec visualiseur (interface ou mode batch).")
+    p = argparse.ArgumentParser(description=f"{APP_NAME} : MP3 → vidéo MP4 animée (interface ou mode batch).")
     p.add_argument("--batch", action="store_true", help="Convertir input/ sans interface")
     p.add_argument("--force", action="store_true", help="(batch) Refaire les vidéos existantes")
     p.add_argument("--no-browser", action="store_true", help="Ne pas ouvrir le navigateur")

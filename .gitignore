@@ -58,3 +58,9 @@ Convertisseur.bat
 # Fichiers temporaires
 *.part
 *.tmp
+
+# Fichiers locaux à ne pas publier
+Image de demo/
+*(ancienne version)*.py
+Onde2Vid.command
+Onde2Vid.bat

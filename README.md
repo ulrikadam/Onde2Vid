@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-sombre.png" alt="Logo Onde2Vid" width="160">
+</p>
+
 # Onde2Vid
 
 **Transformez vos MP3 en vidéos MP4 animées, gratuitement et hors ligne.**
@@ -57,6 +61,8 @@ python3 Onde2Vid.py
 ```
 
 Une interface s’ouvre automatiquement dans votre navigateur. Elle est servie uniquement sur votre ordinateur à l’adresse `127.0.0.1`.
+
+Au premier lancement, un raccourci est créé à côté du script (`Onde2Vid.command` sur macOS, `Onde2Vid.bat` sous Windows) : les fois suivantes, il suffit de double-cliquer dessus.
 
 Déposez vos MP3 dans l’interface, choisissez vos réglages, puis cliquez sur **Convertir**.
 
