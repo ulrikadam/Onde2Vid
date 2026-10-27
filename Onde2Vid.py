@@ -58,6 +58,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 APP_NAME = "Onde2Vid"
 FROZEN = bool(getattr(sys, "frozen", False))        # version autonome (sans Python)
+MS_STORE = FROZEN and "\\windowsapps\\" in sys.executable.lower()   # installé depuis le Microsoft Store
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))   # fichiers fournis
 if os.environ.get("ONDE2VID_DIR"):                  # dossier de travail choisi à la main
     SCRIPT_DIR = Path(os.environ["ONDE2VID_DIR"]).expanduser()
@@ -1830,7 +1831,7 @@ def make_launcher() -> None:
         if sys.platform == "darwin" and not FROZEN and mac_app():
             print(f"➜ {APP_NAME}.app a été créé dans le dossier : la prochaine fois, double-clique "
                   "dessus (tu peux aussi le glisser dans le Dock).")
-        elif sys.platform == "win32" and windows_shortcut():
+        elif sys.platform == "win32" and not MS_STORE and windows_shortcut():
             print(f"➜ Raccourci « {APP_NAME} » ajouté au menu Démarrer.")
         elif sys.platform.startswith("linux") and linux_desktop():
             print(f"➜ « {APP_NAME} » a été ajouté au menu des applications.")

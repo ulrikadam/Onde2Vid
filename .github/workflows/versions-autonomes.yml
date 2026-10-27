@@ -202,6 +202,28 @@ jobs:
             Linux)   tar -czf "../$OUT.tar.gz" Onde2Vid ;;
           esac
 
+      - name: Paquet Microsoft Store (MSIX)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || V="0.0.1"
+          mkdir -p msix/Assets
+          cp -R dist/Onde2Vid/. msix/
+          cp LICENSE msix/LICENSE.txt
+          cp assets/msix/*.png msix/Assets/
+          sed "s/__VERSION__/$V.0/" assets/msix/AppxManifest.xml > msix/AppxManifest.xml
+          MAKEAPPX=$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"10.*/x64/makeappx.exe | sort -V | tail -1)
+          echo "Outil : $MAKEAPPX"
+          "$MAKEAPPX" pack -d msix -p "Onde2Vid-$V-Store.msix" -o
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: Store-MSIX
+          path: Onde2Vid-*-Store.msix
+          if-no-files-found: error
+
       - uses: actions/upload-artifact@v4
         with:
           name: Onde2Vid-${{ matrix.name }}
@@ -219,6 +241,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: out
+          pattern: Onde2Vid-*          # le paquet Store (non signé) n'est pas publié
           merge-multiple: true
 
       - name: Créer la Release GitHub

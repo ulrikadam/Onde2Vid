@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Paquet Microsoft Store d'Onde2Vid. __VERSION__ est remplacé à la fabrication (ex. 1.0.2.0). -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity Name="Nexadam.Onde2Vid"
+            Publisher="CN=A841BFB6-0FBD-4696-995B-182927601E88"
+            Version="__VERSION__"
+            ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Onde2Vid</DisplayName>
+    <PublisherDisplayName>Nexadam</PublisherDisplayName>
+    <Description>Transforme tes MP3 en vidéos MP4 animées, hors ligne.</Description>
+    <Logo>Assets\logo50.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="fr-FR" />
+  </Resources>
+
+  <Applications>
+    <Application Id="Onde2Vid" Executable="Onde2Vid.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="Onde2Vid"
+                          Description="Transforme tes MP3 en vidéos MP4 animées"
+                          BackgroundColor="transparent"
+                          Square150x150Logo="Assets\logo150.png"
+                          Square44x44Logo="Assets\logo44.png" />
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>
