@@ -48,6 +48,7 @@ import time
 import urllib.request
 import webbrowser
 from array import array
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -1231,9 +1232,11 @@ def style_layer(g: Graph, L: dict, s: dict, fps: int, keyed: bool):
 
 
 def prepare(mp3: Path, s: dict, W: int, H: int, start: float, dur: float,
-            preroll: float = 0.0, final: bool = False) -> Graph:
+            preroll: float = 0.0, final: bool = False, env_all: list[float] | None = None,
+            fade_in: bool = True, fade_out: bool = True) -> Graph:
     """Prépare toutes les images et renvoie le graphe de filtres complet.
-    Les temps du graphe commencent à 0 au début du passage lu (start - preroll)."""
+    Les temps du graphe commencent à 0 au début du passage lu (start - preroll).
+    env_all : pulsation déjà calculée sur tout le morceau (conversion en plusieurs parties)."""
     fps = s["fps"]
     with ASSET_LOCK:
         L = compute_layout(mp3, s, W, H)
@@ -1251,7 +1254,11 @@ def prepare(mp3: Path, s: dict, W: int, H: int, start: float, dur: float,
             spr, cw, ch, nc = front_sprite(L, 1 + 0.12 * pulse)
         cmds = None
         if fpulse or zoom:
-            env = bass_envelope(mp3, fps, max(0.0, start - preroll), dur + preroll)
+            if env_all is not None:            # même calibrage pour toutes les parties
+                i0 = max(0, round((start - preroll) * fps))
+                env = env_all[i0:i0 + round((dur + preroll) * fps) + fps]
+            else:
+                env = bass_envelope(mp3, fps, max(0.0, start - preroll), dur + preroll)
             cmds = write_cmds(env, fps, nc if fpulse else 0, ch if fpulse else 0, nbz if zoom else 0, H)
 
         if zoom:
@@ -1302,8 +1309,11 @@ def prepare(mp3: Path, s: dict, W: int, H: int, start: float, dur: float,
             cur = nxt
         if preroll > 0:
             tail.append(f"trim=start={preroll:.3f},setpts=PTS-STARTPTS")
-        if final and s["fade"] and dur > 4:
-            tail.append(f"fade=t=in:st=0:d=1,fade=t=out:st={dur - 1.5:.3f}:d=1.5")
+        if final and s["fade"] and total > 4:
+            if fade_in:
+                tail.append("fade=t=in:st=0:d=1")
+            if fade_out and dur > 1.5:
+                tail.append(f"fade=t=out:st={dur - 1.5:.3f}:d=1.5")
         tail.append("format=yuv420p")
         g.add(f"[{cur}]{','.join(tail)}[v]")
         return g
@@ -1320,6 +1330,150 @@ def _inputs(g: Graph) -> list[str]:
     return out
 
 
+PARALLEL_MIN = 120.0      # morceaux plus courts : conversion d'un seul tenant
+SEGMENT_TARGET = 240.0    # durée visée de chaque partie, en secondes
+
+
+def parallel_workers(W: int, H: int) -> int:
+    """Nombre de parties calculées en même temps (ONDE2VID_PARALLEL=n pour forcer)."""
+    forced = os.environ.get("ONDE2VID_PARALLEL", "").strip()
+    if forced.isdigit():
+        return max(1, int(forced))
+    n = max(1, (os.cpu_count() or 2) // 2)
+    if W * H > 4_000_000:                  # 4K : chaque partie demande beaucoup de mémoire
+        n = min(n, 3)
+    return min(n, 8)
+
+
+class _ProcGroup:
+    """Plusieurs ffmpeg lancés en même temps, arrêtés d'un coup (bouton Annuler)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.procs: set = set()
+        self.stopped = False
+
+    def add(self, p) -> bool:
+        with self.lock:
+            if not self.stopped:
+                self.procs.add(p)
+                return True
+        p.terminate()
+        return False
+
+    def remove(self, p) -> None:
+        with self.lock:
+            self.procs.discard(p)
+
+    def terminate(self) -> None:
+        with self.lock:
+            self.stopped = True
+            procs = list(self.procs)
+        for p in procs:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+
+def _run_ff(cmd: list[str], group: _ProcGroup, on_time=None) -> None:
+    """Lance un ffmpeg du groupe ; on_time(secondes déjà produites)."""
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errlog:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errlog, stdin=subprocess.DEVNULL,
+                                text=True, encoding="utf-8", errors="replace", bufsize=1, **NO_WINDOW)
+        group.add(proc)
+        try:
+            for line in proc.stdout:
+                k, _, v = line.strip().partition("=")
+                if k in ("out_time_us", "out_time_ms") and v.isdigit() and on_time:
+                    on_time(int(v) / 1e6)
+        finally:
+            rc = proc.wait()
+            group.remove(proc)
+        if rc != 0:
+            errlog.seek(0)
+            raise RuntimeError(last_line(errlog.read(), f"ffmpeg a échoué (code {rc})"))
+
+
+def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
+                     on_progress=None, set_proc=None) -> None:
+    """Long morceau : découpé en parties calculées en même temps, puis recollées sans
+    recompression ; le son est encodé une seule fois pour éviter tout raccord audible."""
+    ff, fps = TOOLS["ffmpeg"], s["fps"]
+    W, H = frame_size(s)
+    nseg = max(workers, math.ceil(dur / SEGMENT_TARGET))
+    frames = math.ceil(dur * fps)
+    bounds = [round(k * frames / nseg) for k in range(nseg + 1)]       # en images
+    pre_s = {"spectrum": 12.0, "tunnel": 2.5}.get(s["style"], 2.0)     # mise en route des effets
+    env_all = bass_envelope(mp3, fps, 0.0, None) if s["pulse"] > 0 else None
+    threads = str(max(1, (os.cpu_count() or 2) // workers))
+    work = Path(tempfile.mkdtemp(prefix="parties_", dir=TMP))
+    group = _ProcGroup()
+    done = [0.0] * nseg
+    plock, t0 = threading.Lock(), time.monotonic()
+    base = [ff, "-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-progress", "pipe:1", "-nostats"]
+
+    def progress(k: int, sec: float) -> None:
+        if not on_progress:
+            return
+        with plock:
+            done[k] = sec
+            made, el = sum(done), time.monotonic() - t0
+        on_progress(min(98.0, made / dur * 98), f"{made / el:.2f}x" if el > 2 else "")
+
+    def audio_task() -> None:
+        _run_ff(base + ["-i", str(mp3), "-vn", "-c:a", "aac", "-b:a", f"{s['audio_kbps']}k",
+                        "-t", f"{dur:.3f}", str(work / "son.m4a")], group)
+
+    def part_task(k: int) -> None:
+        if group.stopped:
+            raise RuntimeError("Conversion arrêtée")
+        a, b = bounds[k], bounds[k + 1]
+        start, length = a / fps, (b - a) / fps
+        pre = min(round(pre_s * fps), a) / fps
+        g = prepare(mp3, s, W, H, start, length, preroll=pre, final=True, env_all=env_all,
+                    fade_in=k == 0, fade_out=k == nseg - 1)
+        cmd = list(base)
+        if start - pre > 0:
+            cmd += ["-ss", f"{start - pre:.6f}"]
+        cmd += ["-t", f"{length + pre + 1:.6f}", "-i", str(mp3), *_inputs(g),
+                "-filter_complex", g.text(), "-map", "[v]", "-an",
+                "-c:v", "libx264", "-preset", s["preset"], "-crf", str(s["crf"]), "-r", str(fps),
+                "-threads", threads, "-frames:v", str(b - a), str(work / f"partie{k:03d}.mp4")]
+        _run_ff(cmd, group, lambda sec: progress(k, min(length, sec)))
+        progress(k, length)
+
+    if set_proc:
+        set_proc(group)
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(audio_task)] + [ex.submit(part_task, k) for k in range(nseg)]
+            for f in as_completed(futs):
+                if f.exception():
+                    group.terminate()
+                    ex.shutdown(cancel_futures=True)
+                    raise f.exception()
+        if on_progress:
+            on_progress(99.0, "assemblage…")
+        lst = work / "liste.txt"
+        lst.write_text("".join(f"file 'partie{k:03d}.mp4'\n" for k in range(nseg)), encoding="utf-8")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        part = out.with_name("." + out.stem + ".part.mp4")
+        try:
+            _run_ff(base + ["-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(work / "son.m4a"),
+                            "-map", "0:v", "-map", "1:a", "-c", "copy", "-movflags", "+faststart",
+                            str(part)], group)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        os.replace(part, out)
+    finally:
+        group.terminate()
+        if set_proc:
+            set_proc(None)
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) -> None:
     ensure_tools()
     ff = TOOLS["ffmpeg"]
@@ -1331,6 +1485,9 @@ def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) 
     if on_progress:
         on_progress(0, "préparation…")
     W, H = frame_size(s)
+    workers = parallel_workers(W, H)
+    if dur >= PARALLEL_MIN and workers > 1:
+        return convert_parallel(mp3, s, out, dur, workers, on_progress, set_proc)
     g = prepare(mp3, s, W, H, 0.0, dur, final=True)
     out.parent.mkdir(parents=True, exist_ok=True)
     part = out.with_name("." + out.stem + ".part.mp4")
