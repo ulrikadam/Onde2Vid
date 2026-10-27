@@ -91,6 +91,8 @@ LOGO_SVG = (
 )
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".alac", ".ogg", ".oga", ".opus", ".wma",
+             ".aif", ".aiff", ".aifc", ".caf", ".mp2", ".ac3", ".ape", ".wv", ".mka", ".amr"}   # lus par FFmpeg
 STYLES = ["circle", "retro", "mirror", "tunnel", "cubes", "aurora",
           "cqt", "bars", "waves", "spectrum", "scope"]
 MASK_STYLES = {"circle", "retro", "mirror", "cubes", "aurora"}   # colorés avec un schéma
@@ -382,7 +384,7 @@ def probe(path: Path) -> dict:
 def list_mp3() -> list[Path]:
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     return sorted((f for f in INPUT_DIR.iterdir()
-                   if f.is_file() and f.suffix.lower() == ".mp3" and not f.name.startswith(".")),
+                   if f.is_file() and f.suffix.lower() in AUDIO_EXT and not f.name.startswith(".")),
                   key=lambda p: p.name.lower())
 
 
@@ -477,6 +479,8 @@ def remove_cover(mp3: Path) -> None:
 
 def embed_cover(mp3: Path, s: dict) -> None:
     """Écrit la jaquette dans le fichier MP3 (le son est copié tel quel)."""
+    if mp3.suffix.lower() != ".mp3":
+        raise RuntimeError("Seuls les MP3 peuvent recevoir une jaquette intégrée")
     img, src = track_cover(mp3, s)
     if not img:
         raise RuntimeError("Ce morceau n'a pas de jaquette à intégrer")
@@ -1595,9 +1599,9 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
             name = Path(unquote(q.get("name", [""])[0])).name
             ext = Path(name).suffix.lower()
-            if not name or name.startswith(".") or ext not in IMAGE_EXT | {".mp3"}:
+            if not name or name.startswith(".") or ext not in IMAGE_EXT | AUDIO_EXT:
                 self.rfile.read(length)
-                return self._json({"ok": False, "error": "Seuls les .mp3 et les images sont acceptés"})
+                return self._json({"ok": False, "error": "Seuls les fichiers audio et les images sont acceptés"})
             INPUT_DIR.mkdir(parents=True, exist_ok=True)
             with open(INPUT_DIR / name, "wb") as fh:
                 left = length
@@ -1638,7 +1642,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "FFmpeg introuvable"})
             SETTINGS = clean_settings(data.get("settings"))
             save_settings(SETTINGS)
-            names = [Path(str(n)).name for n in data.get("files", []) if str(n).lower().endswith(".mp3")]
+            names = [Path(str(n)).name for n in data.get("files", []) if Path(str(n)).suffix.lower() in AUDIO_EXT]
             if not names:
                 return self._json({"ok": False, "error": "Aucun morceau sélectionné"})
             err = QUEUE.start(names, dict(SETTINGS), bool(data.get("force")))
@@ -1934,7 +1938,7 @@ def run_batch(force: bool) -> None:
     s = load_settings()
     files = list_mp3()
     if not files:
-        sys.exit(f"Aucun MP3 dans {INPUT_DIR}")
+        sys.exit(f"Aucun fichier audio dans {INPUT_DIR}")
     ok = 0
     for i, mp3 in enumerate(files, 1):
         out = OUTPUT_DIR / (mp3.stem + ".mp4")
@@ -1976,6 +1980,7 @@ HTML = r"""<!doctype html>
 [hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
 button,select,input{font:inherit;color:inherit}
+.credit{font-size:12.5px;color:var(--muted);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}.credit:hover{color:var(--text);text-decoration:underline}
 header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:14px;padding:12px 22px;background:color-mix(in srgb,var(--panel) 88%,transparent);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
 .logo{width:38px;height:38px;flex:none}
 .logo svg{width:100%;height:100%;display:block}
@@ -2086,8 +2091,9 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 <body>
 <header>
   <div class="logo">__LOGO__</div>
-  <div><h1>Onde2Vid</h1><div class="sub">Tes MP3 en vidéos animées pour YouTube</div></div>
+  <div><h1>Onde2Vid</h1><div class="sub">Ta musique en vidéos animées pour YouTube</div></div>
   <div class="grow"></div>
+  <a class="credit" href="https://nexadam.be" target="_blank" rel="noopener">Développé par Adam Ulrik · nexadam.be</a>
   <span class="pill" id="ffpill"><span class="dot"></span><span id="fftext">…</span></span>
   <button class="btn ghost" id="quit">Quitter</button>
 </header>
@@ -2100,8 +2106,8 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       <div class="card-h"><h2>Morceaux</h2><div class="grow"></div><span class="pill" id="count">0</span></div>
       <div class="card-b">
         <label class="drop" id="drop">
-          <b>Glisse tes MP3 ici</b> (et des images si tu veux)<br>ou clique pour choisir des fichiers
-          <input type="file" id="picker" multiple accept=".mp3,audio/mpeg,image/*" hidden>
+          <b>Glisse tes morceaux ici</b> (MP3, WAV, FLAC, M4A, OGG… et des images si tu veux)<br>ou clique pour choisir des fichiers
+          <input type="file" id="picker" multiple accept="audio/*,__AUDIO_ACCEPT__,image/*" hidden>
         </label>
         <div class="toolbar">
           <button class="btn small" id="all">Tout cocher</button>
@@ -2181,7 +2187,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
                   <option value="round">Ronde</option>
                   <option value="fill">Aucune (image plein écran)</option>
                 </select></div>
-              <div class="row"><label>Si le MP3 n'en a pas</label>
+              <div class="row"><label>Si le morceau n'en a pas</label>
                 <div class="inline"><select data-k="cover_default" id="defSel"></select><label class="btn small" title="Importer une image">Importer…<input type="file" id="defPick" accept="image/*" hidden></label></div></div>
             </div>
             <div>
@@ -2383,7 +2389,7 @@ function renderFiles(){
   [...checked].forEach(n => { if (!names.has(n)) checked.delete(n); });
   if (selected && !names.has(selected)) selected = null;
   if (!S.files.length){
-    box.appendChild(el("div","empty","Aucun MP3 pour l'instant. Glisse-les ci-dessus, ou dépose-les dans le dossier input."));
+    box.appendChild(el("div","empty","Aucun morceau pour l'instant. Glisse-les ci-dessus, ou dépose-les dans le dossier input."));
   }
   for (const f of S.files){
     if (!seen.has(f.name)){ seen.add(f.name); if (!f.done) checked.add(f.name); }
@@ -2437,7 +2443,7 @@ function updateAction(){
 
 /* ── jaquette d'un morceau ── */
 const INFO = {added:"Jaquette ajoutée (dossier input/jaquettes).", image:"Image du même nom dans le dossier input.",
-  mp3:"Pochette intégrée au fichier MP3.", default:"Pas de jaquette : la jaquette par défaut sera utilisée.", "":"Pas de jaquette pour ce morceau."};
+  mp3:"Pochette intégrée au fichier audio.", default:"Pas de jaquette : la jaquette par défaut sera utilisée.", "":"Pas de jaquette pour ce morceau."};
 function openCover(name){ cvName = name; $("#cvErr").textContent = ""; renderCover(); $("#coverDlg").classList.add("on"); }
 function closeCover(){ cvName = null; $("#coverDlg").classList.remove("on"); }
 function renderCover(){
@@ -2447,7 +2453,7 @@ function renderCover(){
   if (f.cover_src){ const u = `/api/thumb?name=${enc(f.name)}&s=440&v=${f.cover_v}`; if (img.dataset.u !== u){ img.src = u; img.dataset.u = u; } img.hidden = false; $("#cvNone").hidden = true; }
   else { img.hidden = true; img.dataset.u = ""; $("#cvNone").hidden = false; }
   $("#cvInfo").textContent = INFO[f.cover_src || ""];
-  $("#cvEmbed").hidden = !f.cover_src || f.cover_src === "mp3";
+  $("#cvEmbed").hidden = !f.cover_src || f.cover_src === "mp3" || !/\.mp3$/i.test(f.name);
   $("#cvRemove").hidden = f.cover_src !== "added";
   $("#cvUse").hidden = !S.images.length;
 }
@@ -2512,7 +2518,7 @@ async function upload(files){
     if (j.ok) done.push(j.name); else bad.push(f.name);
   }
   drop.innerHTML = old; bindPicker();
-  if (bad.length) alert("Fichiers ignorés (seuls les .mp3 et les images sont acceptés) :\n" + bad.join("\n"));
+  if (bad.length) alert("Fichiers ignorés (seuls les fichiers audio et les images sont acceptés) :\n" + bad.join("\n"));
   await refresh(true);
   return done;
 }
@@ -2601,13 +2607,13 @@ refresh();
 </body>
 </html>
 """.replace("__DEFAULTS__", json.dumps(DEFAULTS)).replace("__LOGO__", LOGO_SVG).replace(
-    "__FAVICON__", quote(LOGO_SVG))
+    "__FAVICON__", quote(LOGO_SVG)).replace("__AUDIO_ACCEPT__", ",".join(sorted(AUDIO_EXT)))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=f"{APP_NAME} : MP3 → vidéo MP4 animée (interface ou mode batch).")
+    p = argparse.ArgumentParser(description=f"{APP_NAME} : musique (MP3, WAV, FLAC…) → vidéo MP4 animée (interface ou mode batch).")
     p.add_argument("--batch", action="store_true", help="Convertir input/ sans interface")
     p.add_argument("--force", action="store_true", help="(batch) Refaire les vidéos existantes")
     p.add_argument("--no-browser", action="store_true", help="Ne pas ouvrir le navigateur")

@@ -4,7 +4,7 @@
 
 # Onde2Vid
 
-**Transformez vos MP3 en vidéos MP4 animées, gratuitement et hors ligne.**
+**Transformez votre musique (MP3, WAV, FLAC, M4A, OGG…) en vidéos MP4 animées, gratuitement et hors ligne.**
 
 Onde2Vid crée des vidéos prêtes à publier sur YouTube, Instagram, TikTok ou ailleurs : ajoutez vos morceaux, choisissez un visualiseur et une jaquette, puis exportez un MP4 avec le son d’origine.
 
@@ -16,9 +16,9 @@ Tout le traitement est réalisé sur votre ordinateur. Aucun compte, abonnement 
 
 Avec Onde2Vid, vous pouvez :
 
-- convertir un ou plusieurs MP3 en MP4 ;
+- convertir un ou plusieurs morceaux en MP4 : MP3, WAV, FLAC, M4A/AAC, OGG, Opus, AIFF, WMA… ;
 - choisir parmi plusieurs visualiseurs : cercle, égaliseur, onde, spectrogramme, tunnel, aurore, etc. ;
-- utiliser la pochette intégrée au MP3, une jaquette personnalisée ou une image de fond ;
+- utiliser la pochette intégrée au fichier audio, une jaquette personnalisée ou une image de fond ;
 - ajouter un titre, un sous-titre, une barre de progression et des effets de pulsation ;
 - exporter au format paysage (16:9), vertical (9:16) ou carré (1:1) ;
 - générer une vidéo en 720p, 1080p, 1440p ou 4K ;
@@ -98,7 +98,7 @@ Au premier lancement, Onde2Vid crée lui-même son raccourci, avec son icône :
 
 Lancé de cette façon, Onde2Vid s’arrête tout seul une vingtaine de secondes après la fermeture de son onglet (jamais pendant une conversion). S’il est déjà ouvert, un nouveau double-clic ramène simplement son onglet. Les messages sont enregistrés dans `onde2vid.log`.
 
-Déposez vos MP3 dans l’interface, choisissez vos réglages, puis cliquez sur **Convertir**.
+Déposez vos morceaux dans l’interface, choisissez vos réglages, puis cliquez sur **Convertir**.
 
 ## Organisation des fichiers
 
@@ -107,7 +107,7 @@ Ces dossiers sont créés automatiquement à côté du script :
 ```text
 Onde2Vid/
 ├── Onde2Vid.py
-├── input/                 # vos MP3 et éventuelles images de fond
+├── input/                 # vos fichiers audio et éventuelles images de fond
 │   └── jaquettes/         # jaquettes ajoutées depuis l’interface
 ├── output/                # vidéos MP4 générées
 └── reglages.json          # derniers réglages utilisés
@@ -116,13 +116,13 @@ Onde2Vid/
 Pour chaque morceau, la jaquette est choisie dans cet ordre :
 
 1. une jaquette ajoutée depuis l’interface ;
-2. une image du même nom que le MP3 dans `input/` ;
-3. la pochette intégrée au MP3 ;
+2. une image du même nom que le morceau dans `input/` ;
+3. la pochette intégrée au fichier audio ;
 4. la jaquette par défaut choisie dans les réglages.
 
 ## Mode batch
 
-Placez les MP3 dans le dossier `input/`, puis lancez :
+Placez vos fichiers audio dans le dossier `input/`, puis lancez :
 
 ```bash
 python3 Onde2Vid.py --batch
@@ -136,10 +136,10 @@ python3 Onde2Vid.py --batch --force
 
 ## Confidentialité et fichiers
 
-- Les MP3, les images et les vidéos générées restent sur votre machine.
+- Les fichiers audio, les images et les vidéos générées restent sur votre machine.
 - Onde2Vid n’envoie pas vos fichiers vers un service en ligne.
 - Les fichiers temporaires de rendu sont supprimés quand le programme se ferme.
-- L’option permettant d’intégrer une jaquette dans un MP3 modifie ce MP3 : conservez une copie de l’original avant de l’utiliser.
+- L’option permettant d’intégrer une jaquette dans un MP3 (réservée aux MP3) modifie ce MP3 : conservez une copie de l’original avant de l’utiliser.
 
 ## Contribuer
 
