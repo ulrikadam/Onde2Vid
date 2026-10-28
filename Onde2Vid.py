@@ -72,6 +72,7 @@ INPUT_DIR = SCRIPT_DIR / "input"
 COVER_DIR = INPUT_DIR / "jaquettes"
 OUTPUT_DIR = SCRIPT_DIR / "output"
 SETTINGS_FILE = SCRIPT_DIR / "reglages.json"
+TRACKS_FILE = SCRIPT_DIR / "reglages_morceaux.json"   # réglages propres à certains morceaux
 TMP = Path(tempfile.mkdtemp(prefix="onde2vid_"))
 
 LOGO_SVG = (
@@ -111,6 +112,7 @@ AMP_SCHEMES = {"fire", "ice", "vu"}          # dégradé selon la hauteur (sinon
 SCHEME_NAMES = list(SCHEMES) + ["cover", "duo", "solid"]
 QUALITY = {"720p": 720, "1080p": 1080, "1440p": 1440, "4k": 2160}
 ASPECTS = {"16:9": (16, 9), "9:16": (9, 16), "1:1": (1, 1)}
+ROTATE_MINUTES = [1, 2, 3, 5, 10, 15, 20, 30]
 PREVIEW_SHORT = 480          # petit côté de l'aperçu vidéo
 PREVIEW_SECONDS = 6
 
@@ -143,6 +145,10 @@ DEFAULTS = {
     "preset": "veryfast",     # vitesse d'encodage
     "compression": "fast",    # fast : puce graphique si possible ; compact : processeur (libx264)
     "audio_kbps": 320,
+    "rotate": False,          # changer de visualiseur pendant le morceau
+    "rotate_styles": [],      # visualiseurs qui alternent (au moins 2)
+    "rotate_minutes": 10,     # durée de chaque visualiseur
+    "rotate_order": "random", # random (tirage fixe pour chaque morceau) / order
 }
 
 FONT_CANDIDATES = [
@@ -330,6 +336,11 @@ def clean_settings(raw) -> dict:
     s["preset"] = _pick(s["preset"], ["veryfast", "medium", "slow"], "veryfast")
     s["compression"] = _pick(s["compression"], ["fast", "compact"], "fast")
     s["audio_kbps"] = _pick(s["audio_kbps"], [192, 256, 320], 320)
+    s["rotate"] = bool(s["rotate"])
+    rs = s["rotate_styles"] if isinstance(s["rotate_styles"], list) else []
+    s["rotate_styles"] = list(dict.fromkeys(st for st in rs if st in STYLES))
+    s["rotate_minutes"] = _pick(s["rotate_minutes"], ROTATE_MINUTES, 10)
+    s["rotate_order"] = _pick(s["rotate_order"], ["random", "order"], "random")
     return s
 
 
@@ -338,6 +349,23 @@ def load_settings() -> dict:
         return clean_settings(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return dict(DEFAULTS)
+
+
+def load_track_settings() -> dict:
+    try:
+        raw = json.loads(TRACKS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {Path(str(k)).name: clean_settings(v) for k, v in raw.items() if isinstance(v, dict)}
+
+
+def save_track_settings(t: dict) -> None:
+    try:
+        TRACKS_FILE.write_text(json.dumps(t, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def save_settings(s: dict) -> None:
@@ -1235,7 +1263,8 @@ def style_layer(g: Graph, L: dict, s: dict, fps: int, keyed: bool):
 
 def prepare(mp3: Path, s: dict, W: int, H: int, start: float, dur: float,
             preroll: float = 0.0, final: bool = False, env_all: list[float] | None = None,
-            fade_in: bool = True, fade_out: bool = True) -> Graph:
+            fade_in: bool = True, fade_out: bool = True,
+            trans_in: bool = False, trans_out: bool = False) -> Graph:
     """Prépare toutes les images et renvoie le graphe de filtres complet.
     Les temps du graphe commencent à 0 au début du passage lu (start - preroll).
     env_all : pulsation déjà calculée sur tout le morceau (conversion en plusieurs parties)."""
@@ -1316,6 +1345,10 @@ def prepare(mp3: Path, s: dict, W: int, H: int, start: float, dur: float,
                 tail.append("fade=t=in:st=0:d=1")
             if fade_out and dur > 1.5:
                 tail.append(f"fade=t=out:st={dur - 1.5:.3f}:d=1.5")
+        if trans_in:                           # changement de visualiseur : court fondu
+            tail.append(f"fade=t=in:st=0:d={TRANS_D}")
+        if trans_out and dur > TRANS_D:
+            tail.append(f"fade=t=out:st={dur - TRANS_D:.3f}:d={TRANS_D}")
         tail.append("format=yuv420p")
         g.add(f"[{cur}]{','.join(tail)}[v]")
         return g
@@ -1372,6 +1405,41 @@ def video_args(s: dict, W: int, H: int) -> list[str]:
         return ["-c:v", enc, "-b:v", f"{kbps}k", "-prio_speed", "1", "-profile:v", "high",
                 "-r", str(s["fps"])]
     return ["-c:v", "libx264", "-preset", s["preset"], "-crf", str(s["crf"]), "-r", str(s["fps"])]
+
+
+TRANS_D = 0.4             # durée du fondu quand le visualiseur change (secondes)
+
+
+def style_plan(s: dict, dur: float, name: str) -> list[tuple[float, float, str]]:
+    """Visualiseur de chaque passage : [(début, fin, style)].
+    Un seul passage sans alternance ; le tirage au hasard est fixe pour un morceau donné."""
+    styles = s["rotate_styles"]
+    if not s["rotate"] or len(styles) < 2 or dur <= 0:
+        return [(0.0, dur, s["style"])]
+    step = s["rotate_minutes"] * 60.0
+    n = math.ceil(dur / step)
+    if n > 1 and dur - (n - 1) * step < min(30.0, step / 2):   # fin trop courte : rattachée
+        n -= 1
+    if s["rotate_order"] == "order":
+        seq = [styles[i % len(styles)] for i in range(n)]
+    else:
+        rng = random.Random(int(short_hash(name, styles), 16))
+        seq, bag = [], []
+        while len(seq) < n:
+            if not bag:
+                bag = styles[:]
+                rng.shuffle(bag)
+                if seq and bag[0] == seq[-1]:
+                    bag.append(bag.pop(0))
+            seq.append(bag.pop(0))
+    return [(i * step, dur if i == n - 1 else (i + 1) * step, seq[i]) for i in range(n)]
+
+
+def style_at(plan: list[tuple[float, float, str]], t: float) -> str:
+    for a, b, st in plan:
+        if a <= t < b:
+            return st
+    return plan[-1][2]
 
 
 PARALLEL_MIN = 120.0      # morceaux plus courts : conversion d'un seul tenant
@@ -1442,15 +1510,22 @@ def _run_ff(cmd: list[str], group: _ProcGroup, on_time=None) -> None:
 
 
 def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
-                     on_progress=None, set_proc=None) -> None:
+                     plan: list[tuple[float, float, str]], on_progress=None, set_proc=None) -> None:
     """Long morceau : découpé en parties calculées en même temps, puis recollées sans
     recompression ; le son est encodé une seule fois pour éviter tout raccord audible."""
     ff, fps = TOOLS["ffmpeg"], s["fps"]
     W, H = frame_size(s)
-    nseg = max(workers, math.ceil(dur / SEGMENT_TARGET))
     frames = math.ceil(dur * fps)
-    bounds = [round(k * frames / nseg) for k in range(nseg + 1)]       # en images
-    pre_s = {"spectrum": 12.0, "tunnel": 2.5}.get(s["style"], 2.0)     # mise en route des effets
+    want = max(workers, math.ceil(dur / SEGMENT_TARGET))
+    parts = []        # (1re image, image de fin, visualiseur, fondu d'entrée, fondu de sortie)
+    for bi, (t0, t1, st) in enumerate(plan):
+        a0 = round(t0 * fps) if bi else 0
+        b0 = frames if bi == len(plan) - 1 else round(t1 * fps)
+        n = max(1, round(want * (b0 - a0) / frames), math.ceil((b0 - a0) / fps / SEGMENT_TARGET))
+        cuts = [a0 + round(k * (b0 - a0) / n) for k in range(n + 1)]
+        for k in range(n):
+            parts.append((cuts[k], cuts[k + 1], st, k == 0 and bi > 0, k == n - 1 and bi < len(plan) - 1))
+    nseg = len(parts)
     env_all = bass_envelope(mp3, fps, 0.0, None) if s["pulse"] > 0 else None
     threads = str(max(1, (os.cpu_count() or 2) // workers))
     work = Path(tempfile.mkdtemp(prefix="parties_", dir=TMP))
@@ -1474,11 +1549,13 @@ def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
     def part_task(k: int) -> None:
         if group.stopped:
             raise RuntimeError("Conversion arrêtée")
-        a, b = bounds[k], bounds[k + 1]
+        a, b, st, tin, tout = parts[k]
+        sp = dict(s, style=st)
         start, length = a / fps, (b - a) / fps
+        pre_s = {"spectrum": 12.0, "tunnel": 2.5}.get(st, 2.0)          # mise en route des effets
         pre = min(round(pre_s * fps), a) / fps
-        g = prepare(mp3, s, W, H, start, length, preroll=pre, final=True, env_all=env_all,
-                    fade_in=k == 0, fade_out=k == nseg - 1)
+        g = prepare(mp3, sp, W, H, start, length, preroll=pre, final=True, env_all=env_all,
+                    fade_in=k == 0, fade_out=k == nseg - 1, trans_in=tin, trans_out=tout)
         cmd = list(base)
         if start - pre > 0:
             cmd += ["-ss", f"{start - pre:.6f}"]
@@ -1531,9 +1608,11 @@ def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) 
     if on_progress:
         on_progress(0, "préparation…")
     W, H = frame_size(s)
+    plan = style_plan(s, dur, mp3.name)
     workers = parallel_workers(s, W, H)
-    if dur >= PARALLEL_MIN and workers > 1:
-        return convert_parallel(mp3, s, out, dur, workers, on_progress, set_proc)
+    if len(plan) > 1 or (dur >= PARALLEL_MIN and workers > 1):
+        return convert_parallel(mp3, s, out, dur, workers, plan, on_progress, set_proc)
+    s = dict(s, style=plan[0][2])
     g = prepare(mp3, s, W, H, 0.0, dur, final=True)
     out.parent.mkdir(parents=True, exist_ok=True)
     part = out.with_name("." + out.stem + ".part.mp4")
@@ -1570,7 +1649,7 @@ def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) 
     os.replace(part, out)
 
 
-def render_preview(mp3: Path, s: dict) -> tuple[float, float]:
+def render_preview(mp3: Path, s: dict) -> tuple[float, float, str]:
     """Petit extrait vidéo (quelques secondes, en basse définition) avec le son."""
     ensure_tools()
     ff = TOOLS["ffmpeg"]
@@ -1579,6 +1658,7 @@ def render_preview(mp3: Path, s: dict) -> tuple[float, float]:
     total = probe(mp3)["duration"] or 10
     seg = min(PREVIEW_SECONDS, total)
     start = max(0.0, min(total * 0.35, total - seg))
+    s = dict(s, style=style_at(style_plan(s, total, mp3.name), start))
     pre = {"spectrum": 12.0, "tunnel": 2.5}.get(s["style"], 0.0)
     pre = min(pre, start)
     W, H = frame_size(s, PREVIEW_SHORT)
@@ -1597,7 +1677,7 @@ def render_preview(mp3: Path, s: dict) -> tuple[float, float]:
     if r.returncode != 0 or not part.exists():
         raise RuntimeError(last_line(r.stderr, "Échec de l'aperçu"))
     os.replace(part, out)
-    return start, seg
+    return start, seg, s["style"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1616,14 +1696,14 @@ class Queue:
         with self.lock:
             return [dict(j) for j in self.jobs]
 
-    def start(self, names: list[str], s: dict, force: bool) -> str | None:
+    def start(self, names: list[str], per: dict, force: bool) -> str | None:
         with self.lock:
             if self.running:
                 return "Une conversion est déjà en cours"
             self.jobs = [{"name": n, "status": "wait", "progress": 0, "speed": "", "error": ""}
                          for n in names]
             self.running, self.cancelled = True, False
-        threading.Thread(target=self._work, args=(s, force), daemon=True).start()
+        threading.Thread(target=self._work, args=(per, force), daemon=True).start()
         return None
 
     def cancel(self) -> None:
@@ -1637,7 +1717,7 @@ class Queue:
         with self.lock:
             self.proc = p
 
-    def _work(self, s: dict, force: bool) -> None:
+    def _work(self, per: dict, force: bool) -> None:
         for job in self.jobs:
             if self.cancelled:
                 job["status"] = "cancel"
@@ -1652,7 +1732,7 @@ class Queue:
                 continue
             job["status"] = "run"
             try:
-                convert_one(mp3, s, out,
+                convert_one(mp3, per[job["name"]], out,
                             on_progress=lambda p, sp, j=job: j.update(progress=p, speed=sp),
                             set_proc=self._set_proc)
                 job.update(status="ok", progress=100)
@@ -1689,7 +1769,7 @@ def app_state() -> dict:
                       "done": (OUTPUT_DIR / (f.stem + ".mp4")).exists()})
     return {"files": files, "images": list_images(), "jobs": QUEUE.snapshot(),
             "running": QUEUE.running, "ffmpeg": TOOLS["ffmpeg"], "x264": TOOLS["x264"], "hw": bool(hw_encoder()),
-            "title_ok": title_ok(), "settings": SETTINGS,
+            "title_ok": title_ok(), "settings": SETTINGS, "tracks": TRACK_SETTINGS,
             "input": str(INPUT_DIR), "output": str(OUTPUT_DIR)}
 
 
@@ -1699,6 +1779,7 @@ def app_state() -> dict:
 
 TOKEN = secrets.token_hex(16)
 SETTINGS = load_settings()
+TRACK_SETTINGS = load_track_settings()   # nom du fichier → réglages propres
 SERVER: ThreadingHTTPServer | None = None
 ALLOWED_HOSTS: set[str] = set()
 ACTIVITY = {"seen": time.monotonic(), "bye": 0.0}   # dernière visite de la page / onglet fermé
@@ -1835,19 +1916,36 @@ class Handler(BaseHTTPRequestHandler):
             data = {}
 
         if url.path == "/api/settings":
+            track = Path(str(data.get("track") or "")).name
+            if track:                          # réglages propres à un morceau
+                TRACK_SETTINGS[track] = clean_settings(data.get("settings"))
+                save_track_settings(TRACK_SETTINGS)
+                return self._json({"ok": True, "settings": TRACK_SETTINGS[track]})
             SETTINGS = clean_settings(data.get("settings"))
             save_settings(SETTINGS)
             self._json({"ok": True, "settings": SETTINGS})
+        elif url.path == "/api/track":
+            name = Path(str(data.get("name") or "")).name
+            if not name:
+                return self._json({"ok": False, "error": "Morceau introuvable"})
+            if data.get("action") == "make":
+                TRACK_SETTINGS[name] = clean_settings(data.get("settings") or SETTINGS)
+            else:
+                TRACK_SETTINGS.pop(name, None)
+            save_track_settings(TRACK_SETTINGS)
+            self._json({"ok": True, "tracks": TRACK_SETTINGS})
         elif url.path == "/api/convert":
             ensure_tools()
             if not TOOLS["ffmpeg"]:
                 return self._json({"ok": False, "error": "FFmpeg introuvable"})
-            SETTINGS = clean_settings(data.get("settings"))
-            save_settings(SETTINGS)
+            if data.get("settings"):
+                SETTINGS = clean_settings(data.get("settings"))
+                save_settings(SETTINGS)
             names = [Path(str(n)).name for n in data.get("files", []) if Path(str(n)).suffix.lower() in AUDIO_EXT]
             if not names:
                 return self._json({"ok": False, "error": "Aucun morceau sélectionné"})
-            err = QUEUE.start(names, dict(SETTINGS), bool(data.get("force")))
+            per = {n: dict(TRACK_SETTINGS.get(n) or SETTINGS) for n in names}   # réglages de chaque morceau
+            err = QUEUE.start(names, per, bool(data.get("force")))
             self._json({"ok": err is None, "error": err})
         elif url.path == "/api/cancel":
             QUEUE.cancel()
@@ -1860,8 +1958,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "Choisis un morceau"})
             try:
                 with PREVIEW_LOCK:
-                    at, seg = render_preview(mp3, s)
-                self._json({"ok": True, "at": at, "dur": seg})
+                    at, seg, st = render_preview(mp3, s)
+                self._json({"ok": True, "at": at, "dur": seg, "style": st})
             except Exception as e:  # noqa: BLE001
                 self._json({"ok": False, "error": str(e)[:300]})
         elif url.path == "/api/cover":
@@ -2137,7 +2235,7 @@ def run_batch(force: bool) -> None:
     ensure_tools()
     if not TOOLS["ffmpeg"]:
         sys.exit(f"FFmpeg introuvable : dépose le fichier 'ffmpeg' dans {SCRIPT_DIR}")
-    s = load_settings()
+    s, tracks = load_settings(), load_track_settings()
     files = list_mp3()
     if not files:
         sys.exit(f"Aucun fichier audio dans {INPUT_DIR}")
@@ -2152,7 +2250,7 @@ def run_batch(force: bool) -> None:
             print(f"\r[{i}/{len(files)}] {name}  {p:5.1f} %  {sp}   ", end="", flush=True)
 
         try:
-            convert_one(mp3, s, out, on_progress=show)
+            convert_one(mp3, tracks.get(mp3.name) or s, out, on_progress=show)
             print(f"\r[{i}/{len(files)}] {mp3.name}  ✓" + " " * 20)
             ok += 1
         except RuntimeError as e:
@@ -2235,6 +2333,13 @@ main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:18px;
 .style svg{width:100%;height:32px;display:block;margin-bottom:4px}
 .style span{font-size:11.5px;font-weight:550}
 .style.new span::after{content:" ★";color:var(--accent2)}
+.style{position:relative}.style .rk{position:absolute;top:4px;right:6px;font-size:10.5px;font-weight:700;color:var(--accent)}
+.scope{display:flex;align-items:center;gap:10px;padding:8px 12px;margin-bottom:12px;border-radius:10px;background:var(--panel2);border:1px solid var(--line);font-size:13px}
+.scope.own{border-color:var(--accent);background:var(--sel)}
+.scope b{font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.rotbox{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:-4px 0 14px}
+.rotbox .hint{flex-basis:100%;font-size:12.5px;color:var(--muted)}
+.tag.own{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
 .sect{border-top:1px solid var(--line);padding-top:12px;margin-top:6px}
 .sect h3{font-size:12px;margin:0 0 8px;color:var(--muted);font-weight:600}
 .row{display:grid;grid-template-columns:128px minmax(0,1fr);align-items:center;gap:10px;min-height:36px;margin-bottom:4px}
@@ -2345,7 +2450,15 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     <div class="card">
       <div class="card-h"><h2>Réglages</h2><div class="grow"></div><button class="btn small ghost" id="reset">Valeurs par défaut</button></div>
       <div class="card-b">
+        <div class="scope" id="scope"><span id="scopeTxt"></span><div class="grow"></div><button class="btn small" id="scopeBtn"></button></div>
         <div class="styles" id="styles"></div>
+        <div class="rotbox">
+          <label class="check"><input type="checkbox" data-k="rotate"><span>Changer de visualiseur pendant le morceau</span></label>
+          <span class="inline" id="rotOpts"><span style="white-space:nowrap">toutes les</span>
+            <select data-k="rotate_minutes"><option value="1">1 min</option><option value="2">2 min</option><option value="3">3 min</option><option value="5">5 min</option><option value="10">10 min</option><option value="15">15 min</option><option value="20">20 min</option><option value="30">30 min</option></select>
+            <select data-k="rotate_order"><option value="random">au hasard</option><option value="order">dans l'ordre</option></select></span>
+          <div class="hint" id="rotHint"></div>
+        </div>
 
         <div class="grid2">
           <div>
@@ -2495,6 +2608,7 @@ const STYLES = {
 };
 const MASK = ["circle","retro","mirror","cubes","aurora"], ROUND = ["circle","tunnel"], CQT = ["circle","retro","mirror","cubes"];
 let S = null, settings = null, checked = new Set(), seen = new Set(), selected = null, saveT = null, lastImgs = "", cvName = null;
+let globalSet = null, tracks = {}, pendingSave = null;   // réglages communs / propres à certains morceaux
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
@@ -2520,30 +2634,48 @@ function buildStyles(){
   for (const [k,[name,svg,isNew]] of Object.entries(STYLES)){
     const b = el("div","style" + (isNew ? " new" : "")); b.dataset.style = k; b.title = name;
     b.innerHTML = svg; b.appendChild(el("span",null,name));
-    b.onclick = () => { settings.style = k; applySettings(); changed(); };
+    b.onclick = () => {
+      if (settings.rotate){
+        const r = settings.rotate_styles, i = r.indexOf(k);
+        if (i >= 0) r.splice(i, 1); else r.push(k);
+        if (r.length) settings.style = r[0];
+      } else settings.style = k;
+      applySettings(); changed();
+    };
     box.appendChild(b);
   }
 }
 function applySettings(){
-  $$(".style").forEach(b => b.classList.toggle("on", b.dataset.style === settings.style));
+  const rot = settings.rotate;
+  $$(".style").forEach(b => {
+    const k = b.dataset.style, i = settings.rotate_styles.indexOf(k);
+    b.classList.toggle("on", rot ? i >= 0 : k === settings.style);
+    let rk = b.querySelector(".rk");
+    if (rot && i >= 0){ if (!rk){ rk = el("i","rk"); b.appendChild(rk); } rk.textContent = settings.rotate_order === "order" ? i + 1 : "✓"; }
+    else if (rk) rk.remove();
+  });
+  $("#rotOpts").hidden = !rot;
+  $("#rotHint").textContent = !rot ? "" : rotHint();
   $$("[data-k]").forEach(inp => {
     const v = settings[inp.dataset.k];
     if (inp.type === "radio") inp.checked = (inp.value === String(v));
     else if (inp.type === "checkbox") inp.checked = !!v;
     else if (inp !== document.activeElement || inp.type !== "text") inp.value = String(v);
   });
-  const st = settings.style, img = settings.image, mask = MASK.includes(st), rnd = ROUND.includes(st);
+  const st = settings.style, img = settings.image;
+  const sts = rot && settings.rotate_styles.length ? settings.rotate_styles : [st];   // visualiseurs utilisés
+  const mask = sts.some(x => MASK.includes(x)), rnd = sts.every(x => ROUND.includes(x));
   $("#o-size").textContent = (!rnd && settings.viz_size >= 100) ? "Plein" : settings.viz_size + " %";
   $("#o-sens").textContent = settings.sensitivity + " %";
   $("#o-pulse").textContent = settings.pulse ? settings.pulse + " %" : "Aucune";
   $("#l-size").textContent = rnd ? "Taille du cercle" : "Taille";
   const solid = ["solid","duo"].includes(settings.colors);
   $("#r-scheme").classList.toggle("hide", !mask);
-  $("#r-color").classList.toggle("hide", !(["waves","bars","scope"].includes(st) || (mask && solid)));
+  $("#r-color").classList.toggle("hide", !(sts.some(x => ["waves","bars","scope"].includes(x)) || (mask && solid)));
   $("#color2").hidden = !(mask && settings.colors === "duo");
-  $("#r-palette").classList.toggle("hide", !["spectrum","tunnel"].includes(st));
+  $("#r-palette").classList.toggle("hide", !sts.some(x => ["spectrum","tunnel"].includes(x)));
   $("#r-glow").classList.toggle("hide", !mask);
-  $("#r-sens").classList.toggle("hide", !CQT.includes(st));
+  $("#r-sens").classList.toggle("hide", !sts.some(x => CQT.includes(x)));
   $("#r-pos").classList.toggle("hide", rnd || settings.viz_size >= 100);
   $("#r-effect").classList.toggle("hide", img === "__none__");
   $("#r-bg").classList.toggle("hide", img !== "__none__" && img !== "__auto__");
@@ -2551,9 +2683,37 @@ function applySettings(){
   $("#r-pulsebg").classList.toggle("hide", !settings.pulse);
   $("#titleSel").value = settings.title ? settings.title_src : "none";
 }
+function curTrack(){ return selected && tracks[selected] ? selected : null; }
 function changed(){
   clearTimeout(saveT);
-  saveT = setTimeout(() => post("/api/settings",{settings}), 350);
+  const obj = settings, track = curTrack();
+  pendingSave = () => { pendingSave = null; return post("/api/settings",{settings: obj, track}); };
+  saveT = setTimeout(pendingSave, 350);
+  renderScope();
+}
+async function flushSave(){ clearTimeout(saveT); if (pendingSave) await pendingSave(); }
+function useSettingsFor(){                 // le panneau montre les réglages du morceau choisi
+  settings = curTrack() ? tracks[selected] : globalSet;
+  lastImgs = ""; fillImages(); applySettings(); renderScope();
+}
+function renderScope(){
+  const own = !!curTrack(), box = $("#scope"), b = $("#scopeBtn"), t = $("#scopeTxt");
+  box.classList.toggle("own", own); t.innerHTML = "";
+  if (own){ t.append("Réglages propres à "); t.appendChild(el("b",null,selected)); b.textContent = "Revenir aux réglages communs"; }
+  else { t.textContent = "Réglages communs à tous les morceaux"; b.textContent = "Réglages propres à ce morceau"; }
+  b.disabled = !selected;
+}
+function rotHint(){
+  const n = settings.rotate_styles.length;
+  if (n < 2) return "Clique sur au moins 2 visualiseurs ci-dessus.";
+  const f = S && S.files.find(x => x.name === selected), step = settings.rotate_minutes * 60;
+  const m = settings.rotate_minutes;
+  let txt = `${n} visualiseurs, un nouveau ${m === 1 ? "chaque minute" : "toutes les " + m + " min"} (${settings.rotate_order === "order" ? "dans l'ordre" : "au hasard"}).`;
+  if (f && f.duration){
+    let p = Math.ceil(f.duration / step); if (p > 1 && f.duration - (p - 1) * step < Math.min(30, step / 2)) p--;
+    txt += p > 1 ? ` Sur ce morceau (${fmt(f.duration)}) : ${p} passages.` : ` Ce morceau (${fmt(f.duration)}) est plus court : un seul visualiseur.`;
+  }
+  return txt;
 }
 function bindInputs(){
   $$("[data-k]").forEach(inp => {
@@ -2562,8 +2722,10 @@ function bindInputs(){
       const k = inp.dataset.k;
       if (inp.type === "radio" && !inp.checked) return;
       let v = inp.type === "checkbox" ? inp.checked : inp.value;
-      if (["viz_size","fps","crf","audio_kbps","pulse","sensitivity"].includes(k)) v = parseInt(v,10);
-      settings[k] = v; applySettings(); changed();
+      if (["viz_size","fps","crf","audio_kbps","pulse","sensitivity","rotate_minutes"].includes(k)) v = parseInt(v,10);
+      settings[k] = v;
+      if (k === "rotate" && v && !settings.rotate_styles.length) settings.rotate_styles = [settings.style];
+      applySettings(); changed();
     });
   });
   $("#titleSel").onchange = e => {
@@ -2610,6 +2772,7 @@ function renderFiles(){
     const name = el("div","fname",f.name); name.title = f.name;
     if (f.tag) name.appendChild(el("small",null,f.tag));
     const meta = el("div","fmeta");
+    if (tracks[f.name]) meta.appendChild(el("span","tag own","réglages perso"));
     if (f.cover_src && f.cover_src !== "default") meta.appendChild(el("span","tag",SRC[f.cover_src]));
     meta.appendChild(el("span",null,fmt(f.duration)));
     if (f.done){
@@ -2619,7 +2782,10 @@ function renderFiles(){
       meta.appendChild(pl);
     }
     row.append(cb, th, name, meta);
-    row.onclick = () => { selected = f.name; renderFiles(); updatePvLabel(); };
+    row.onclick = async () => {
+      if (selected === f.name) return;
+      await flushSave(); selected = f.name; renderFiles(); updatePvLabel(); useSettingsFor();
+    };
     row.ondragover = e => { e.preventDefault(); e.stopPropagation(); row.classList.add("hot"); };
     row.ondragleave = () => row.classList.remove("hot");
     row.ondrop = async e => {
@@ -2698,7 +2864,7 @@ function updatePvLabel(){
 }
 async function preview(){
   const t = pvTarget(); if (!t) return;
-  clearTimeout(saveT); await post("/api/settings",{settings});
+  await flushSave();
   const scr = $("#screen"), v = $("#pvvid"); scr.classList.add("loading"); $("#preview").disabled = true;
   v.pause();
   $("#pvlbl").textContent = "Rendu de " + t + "…"; $("#pvlbl").classList.remove("err");
@@ -2707,7 +2873,7 @@ async function preview(){
   if (r.ok){
     v.src = "/preview.mp4?t=" + Date.now(); v.hidden = false; $("#ph").hidden = true;
     v.play().catch(() => {});
-    $("#pvlbl").textContent = `${t} · de ${fmt(r.at)} à ${fmt(r.at + r.dur)}`;
+    $("#pvlbl").textContent = `${t} · de ${fmt(r.at)} à ${fmt(r.at + r.dur)}` + (settings.rotate && r.style && STYLES[r.style] ? ` · ${STYLES[r.style][0]}` : "");
   } else { $("#pvlbl").textContent = "Erreur : " + r.error; $("#pvlbl").classList.add("err"); }
 }
 
@@ -2736,9 +2902,11 @@ async function refresh(once){
   try{
     const r = await fetch("/api/state",{cache:"no-store"}); S = await r.json();
     $("#offline").classList.remove("on");
-    if (!settings){ settings = S.settings; }
+    const first = !settings;
+    if (first){ globalSet = S.settings; tracks = S.tracks || {}; settings = globalSet; }
     fillImages(); applySettings();
     renderFiles(); renderJobs(); renderStatus();
+    if (first) useSettingsFor();
     if (S.running) next = 700;
   }catch(e){ $("#offline").classList.add("on"); next = 3000; }
   timer = setTimeout(refresh, next);
@@ -2769,12 +2937,30 @@ $("#none").onclick = () => { checked.clear(); renderFiles(); };
 $("#openIn").onclick = () => post("/api/open",{what:"input"});
 $("#openOut").onclick = () => post("/api/open",{what:"output"});
 $("#preview").onclick = preview;
-$("#reset").onclick = () => { if (confirm("Remettre les réglages par défaut ?")) { settings = Object.assign({}, DEFAULTS); applySettings(); changed(); } };
+$("#reset").onclick = () => {
+  if (!confirm("Remettre les réglages par défaut ?")) return;
+  const d = JSON.parse(JSON.stringify(DEFAULTS));
+  if (curTrack()) tracks[selected] = d; else globalSet = d;
+  settings = d; applySettings(); changed();
+};
+$("#scopeBtn").onclick = async () => {
+  if (!selected) return;
+  await flushSave();
+  if (curTrack()){
+    if (!confirm(`« ${selected} » utilisera de nouveau les réglages communs. Ses réglages propres seront effacés.`)) return;
+    const r = await post("/api/track",{name: selected, action: "drop"});
+    if (r.ok) delete tracks[selected];
+  } else {
+    const r = await post("/api/track",{name: selected, action: "make", settings: globalSet});
+    if (r.ok) tracks[selected] = r.tracks[selected];
+  }
+  useSettingsFor(); renderFiles();
+};
 $("#cancel").onclick = () => post("/api/cancel").then(() => refresh(true));
 $("#go").onclick = async () => {
   const files = S.files.filter(f => checked.has(f.name)).map(f => f.name);
-  clearTimeout(saveT);
-  const r = await post("/api/convert",{files, settings, force: $("#force").checked});
+  await flushSave();
+  const r = await post("/api/convert",{files, settings: globalSet, force: $("#force").checked});
   if (!r.ok) alert(r.error || "Erreur"); refresh(true);
 };
 $("#quit").onclick = async () => {
