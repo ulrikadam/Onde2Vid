@@ -95,10 +95,12 @@ LOGO_SVG = (
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".alac", ".ogg", ".oga", ".opus", ".wma",
              ".aif", ".aiff", ".aifc", ".caf", ".mp2", ".ac3", ".ape", ".wv", ".mka", ".amr"}   # lus par FFmpeg
-STYLES = ["circle", "retro", "mirror", "tunnel", "cubes", "aurora",
+STYLES = ["mandala", "synthwave", "warp", "circle", "retro", "mirror", "tunnel", "cubes", "aurora",
           "cqt", "bars", "waves", "spectrum", "scope"]
-MASK_STYLES = {"circle", "retro", "mirror", "cubes", "aurora"}   # colorés avec un schéma
-ROUND_STYLES = {"circle", "tunnel"}                              # jaquette ronde au centre
+MASK_STYLES = {"circle", "retro", "mirror", "cubes", "aurora",
+               "mandala", "synthwave", "warp"}                   # colorés avec un schéma
+ROUND_STYLES = {"circle", "tunnel", "mandala", "synthwave", "warp"}   # jaquette ronde
+BEAT_STYLES = {"synthwave", "warp"}                              # vitesse qui suit les basses
 PALETTES = ["intensity", "rainbow", "fire", "cool", "magma", "viridis", "plasma", "nebulae"]
 SCHEMES = {
     "neon":    ["#00e5ff", "#7a5cff", "#ff3df5"],
@@ -644,7 +646,7 @@ def compute_layout(mp3: Path, s: dict, W: int, H: int) -> dict:
 
     title = title_text(mp3, s) if (s["title"] and title_ok()) else ""
     sub = s["subtitle"].strip() if title_ok() else ""
-    text_top = (not rnd) and s["viz_pos"] != "top"
+    text_top = st == "synthwave" or ((not rnd) and s["viz_pos"] != "top")
     texts, band = text_items(title, sub, W, H, U, text_top)
     vh, vy = viz_geometry(s, H, U)
     L = dict(W=W, H=H, U=U, s=s, style=st, cover=cover, csrc=csrc, bg_img=bg_img, front=front,
@@ -668,12 +670,19 @@ def compute_layout(mp3: Path, s: dict, W: int, H: int) -> dict:
     if rnd:
         room = max(U * 0.12, min(W, bottom - top) / 2 - U * 0.035)
         t = (s["viz_size"] - 15) / 85
-        if st == "circle":
-            rc, gap, depth = U * (0.15 + 0.2 * t), U * 0.012, U * (0.13 + 0.06 * t)
+        if st in ("circle", "mandala"):
+            if st == "circle":
+                rc, gap, depth = U * (0.15 + 0.2 * t), U * 0.012, U * (0.13 + 0.06 * t)
+            else:
+                rc, gap, depth = U * (0.12 + 0.16 * t), U * 0.008, U * (0.2 + 0.08 * t)
             if rc + gap + depth > room:
                 k = room / (rc + gap + depth)
                 rc, gap, depth = rc * k, gap * k, depth * k
             L.update(rc=int(rc), r_in=int(rc + gap), r_out=int(rc + gap + depth))
+        elif st == "synthwave":                 # la jaquette est le soleil, posé sur l'horizon
+            hz = even(H * 0.62)
+            rc = max(U * 0.05, min(U * (0.1 + 0.12 * t), (hz - top - U * 0.04) / 2))
+            L.update(hz=hz, rc=int(rc), fy=hz - int(rc) - int(U * 0.012))
         else:
             L["rc"] = int(min(room * 0.6, U * (0.1 + 0.14 * t)))
     else:
@@ -1018,6 +1027,184 @@ def tunnel_maps(TW: int, TH: int, T: int, F: int, r0: float, cx: float, cy: floa
     return cached_maps("tunnel", (T, F, round(r0, 1), round(cx, 1), round(cy, 1), twist), TW, TH, build)
 
 
+def petal_maps(S: int, r_in: int, depth: float, petals: int, band: int, SH: int,
+               phase: float, power: float):
+    """Couronne de pétales lisses : leur longueur suit le niveau d'une bande de fréquences.
+    Pixel allumé si niveau ≥ distance / forme du pétale (contour net, quelle que soit la musique)."""
+    def build():
+        n = S * S
+        xm, ym = array("H", [BAD]) * n, array("H", [BAD]) * n
+        c, top, wedge = (S - 1) / 2, SH - 1, 2 * math.pi / petals
+        hyp, at2, pi, cos = math.hypot, math.atan2, math.pi, math.cos
+        i = 0
+        for v in range(S):
+            dy = v - c
+            for u in range(S):
+                dx = u - c
+                f = (hyp(dx, dy) - r_in) / depth
+                if 0.0 <= f < 1.0:
+                    w = abs(2 * (((at2(dx, -dy) + pi + phase * wedge) % wedge) / wedge) - 1)
+                    shape = cos(w * pi / 2) ** power
+                    if shape > 1e-3 and f < shape:
+                        xm[i], ym[i] = band, int((1.0 - f / shape) * top + 0.5)
+                i += 1
+        return [xm, ym]
+    return cached_maps("petals", (r_in, round(depth, 1), petals, band, SH, phase, power), S, S, build)
+
+
+def radius_colors(S: int, r_in: int, depth: float, SH: int):
+    """Position dans le dégradé selon la distance au centre (pour colorer les pétales)."""
+    def build():
+        xc, yc = array("H", [0]) * (S * S), array("H")
+        c, top = (S - 1) / 2, SH - 1
+        for v in range(S):
+            dy = v - c
+            for u in range(S):
+                f = (math.hypot(u - c, dy) - r_in) / depth
+                yc.append(max(0, min(top, int((1.0 - f) * top + 0.5))))
+        return [xc, yc]
+    return cached_maps("radius", (r_in, round(depth, 1), SH), S, S, build)
+
+
+def warp_maps(TW: int, TH: int, A: int, K: int, r0: float, cx: float, cy: float):
+    """Hyperespace : texture d'étoiles enroulée autour du centre (profondeur logarithmique),
+    plus l'éclat de chaque point (sombre au centre, vif vers les bords)."""
+    def build():
+        rmax = max(math.hypot(cx, cy), math.hypot(TW - cx, cy), math.hypot(cx, TH - cy),
+                   math.hypot(TW - cx, TH - cy)) + 2
+        lnr = math.log(rmax / r0)
+        hyp, at2, log, pi, tau = math.hypot, math.atan2, math.log, math.pi, 2 * math.pi
+        xm, ym, xc, lum = array("H"), array("H"), array("H"), array("H")
+        for v in range(TH):
+            dy = v + 0.5 - cy
+            for u in range(TW):
+                dx = u + 0.5 - cx
+                r = hyp(dx, dy)
+                if r < r0:
+                    xm.append(BAD)
+                    ym.append(BAD)
+                    xc.append(0)
+                    lum.append(0)
+                    continue
+                d = log(r / r0) / lnr
+                col = int((at2(dx, -dy) + pi) / tau * A) % A
+                xm.append(col)
+                ym.append(int((1.0 - d) * (K - 1)))
+                xc.append(col)
+                lum.append(int(65535 * min(1.0, d * 1.15) ** 1.1))
+        return [xm, ym, xc, array("H", [0]) * (TW * TH), lum]
+    return cached_maps("warp", (A, K, round(r0, 1), round(cx, 1), round(cy, 1)), TW, TH, build)
+
+
+def write_pgm8(path: Path, w: int, h: int, data: bytes) -> Path:
+    part = path.with_name(path.stem + ".part" + path.suffix)
+    with open(part, "wb") as fh:
+        fh.write(b"P5\n%d %d\n255\n" % (w, h))
+        fh.write(data)
+    os.replace(part, path)
+    return path
+
+
+def cached_gray(name: str, params, w: int, h: int, build) -> Path:
+    """Image en niveaux de gris calculée une seule fois (texture, lignes du sol…)."""
+    p = TMP / f"img_{short_hash(name, params, w, h)}.pgm"
+    return p if p.exists() else write_pgm8(p, w, h, build())
+
+
+def star_texture(A: int, K: int) -> Path:
+    """Étoiles filantes (tête vers l'extérieur, traînée vers le centre), répétée 2 fois en hauteur."""
+    def build():
+        rng = random.Random(11)
+        buf = bytearray(A * K)
+        for _ in range(int(A * K * 0.0007)):
+            c, r = rng.randrange(A), rng.randrange(K)
+            ln, b = rng.randint(12, 44), rng.uniform(0.5, 1.0)
+            for j in range(ln):
+                val = int(255 * b * (1 - j / ln) ** 1.4)
+                idx = (r + j) % K * A + c
+                if val > buf[idx]:
+                    buf[idx] = val
+        return bytes(buf) * 2
+    return cached_gray("stars", (A, K), A, 2 * K, build)
+
+
+def halo_image(w: int, h: int, cx: float, cy: float, rc: float, width: float, peak: float) -> Path:
+    """Lueur douce autour d'un disque (nulle à l'intérieur, pour ne pas teinter la jaquette)."""
+    def build():
+        buf = bytearray(w * h)
+        for v in range(h):
+            dy2 = (v + 0.5 - cy) ** 2
+            row = v * w
+            for u in range(w):
+                r = math.sqrt((u + 0.5 - cx) ** 2 + dy2)
+                if r > rc:
+                    buf[row + u] = int(255 * peak * math.exp(-(r - rc) / width))
+        return bytes(buf)
+    return cached_gray("halo", (round(cx, 1), round(cy, 1), round(rc, 1), round(width, 1), peak), w, h, build)
+
+
+def _lines(x: float, f: float, w: float) -> float:
+    """Part d'un pixel (largeur f, en périodes) couverte par des lignes d'épaisseur w (anticrénelage)."""
+    def acc(t):
+        k = math.floor(t)
+        return k * w + min(t - k, w)
+    return (acc(x + f / 2) - acc(x - f / 2)) / f
+
+
+def synth_floor(W: int, nrows: int, K: int, cell: float, cols: int):
+    """Sol quadrillé en perspective : lignes de fuite fixes et lignes horizontales qui défilent
+    (une colonne par position du défilement). Lointain estompé, lueur sur l'horizon."""
+    wh, wv = 0.08, 0.035
+    zs = [nrows / (j + 0.5) for j in range(nrows)]
+    fog = [math.exp(-z / 6.5) for z in zs]
+
+    def strip():
+        buf = bytearray(K * nrows)
+        for j in range(nrows):
+            fp = max(1e-4, (nrows / max(j, 0.25) - nrows / (j + 1)) / cell)
+            zc = zs[j] / cell
+            row = j * K
+            for p in range(K):
+                buf[row + p] = int(255 * fog[j] * _lines(zc + p / K, fp, wh))
+        return bytes(buf)
+
+    def verticals():
+        buf = bytearray(W * nrows)
+        sx = W / cols
+        for j in range(nrows):
+            fpx = zs[j] / sx
+            dz = (nrows / max(j, 0.25) - nrows / (j + 1)) / sx     # glissement des lignes sur la hauteur du pixel
+            haze = 0.45 * math.exp(-j / max(2.0, nrows * 0.035))
+            row, k = j * W, zs[j] / sx
+            for u in range(W):
+                X = u + 0.5 - W / 2
+                val = max(fog[j] * _lines(X * k + wv / 2, fpx + abs(X) * dz, wv), haze)
+                buf[row + u] = 255 if j < 2 else int(255 * val)
+        return bytes(buf)
+    return (cached_gray("sol_h", (K, cell, wh), K, nrows, strip),
+            cached_gray("sol_v", (cols, wv, 2), W, nrows, verticals))
+
+
+def ridge_maps(W: int, MH: int, SW: int, SH: int):
+    """Montagnes de part et d'autre du soleil : basses sur les bords, aigus au centre."""
+    def build():
+        xm, ym = array("H"), array("H")
+        half, top = W / 2, SH - 1
+        for v in range(MH):
+            f = (MH - v - 0.5) / MH
+            for u in range(W):
+                d = abs(u + 0.5 - half) / half
+                fe = f / ((0.28 + 0.72 * d ** 1.3) * (0.84 + 0.16 * math.sin(d * 23.0 + 1.3) * math.cos(d * 7.1)))
+                if fe < 1.0:
+                    xm.append(min(SW - 1, int((1 - d) * (SW - 1))))
+                    ym.append(int((1 - fe) * top + 0.5))
+                else:
+                    xm.append(BAD)
+                    ym.append(BAD)
+        return [xm, ym]
+    return cached_maps("ridge", (SW, SH, 2), W, MH, build)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Pulsation sur les basses
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1215,6 +1402,172 @@ def layer_tunnel(g: Graph, L: dict, s: dict, fps: int, keyed: bool):
     return out, 0, 0
 
 
+def beat_positions(L: dict, rate: float, boost: float) -> list[float]:
+    """Avancée d'un défilement à chaque image : vitesse de base, accélérée sur les basses.
+    Comptée depuis le début du morceau, pour que les parties calculées à part se raccordent."""
+    env, acc, i0, out = L["env"], L["E0"], L["i0"], []
+    for j in range(L["nfr"]):
+        out.append(rate * (i0 + j + boost * acc))
+        if j < len(env):
+            acc += env[j]
+    return out
+
+
+def frame_cmds(fps: int, *tracks) -> Path:
+    """Commandes sendcmd image par image ; tracks : (cible, option, valeurs)."""
+    lines, last = [], [None] * len(tracks)
+    for j in range(max(len(v) for _, _, v in tracks)):
+        parts = []
+        for i, (target, key, vals) in enumerate(tracks):
+            v = vals[min(j, len(vals) - 1)]
+            if v != last[i]:
+                parts.append(f"{target} {key} {v}")
+                last[i] = v
+        if parts:
+            lines.append(f"{j / fps:.4f} " + ", ".join(parts) + ";")
+    path = TMP / f"cmd_{secrets.token_hex(6)}.txt"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def flash_values(L: dict, low: float) -> list[str]:
+    """Luminosité qui s'éclaire sur les basses (gris de low à blanc)."""
+    env, out = L["env"], []
+    for j in range(L["nfr"]):
+        e = env[j] if j < len(env) else 0.0
+        v = min(255, int(255 * (low + (1 - low) * e) / 8 + 0.5) * 8)
+        out.append(f"0x{v:02x}{v:02x}{v:02x}")
+    return out
+
+
+def flash(g: Graph, mask: str, w: int, h: int, fps: int, name: str) -> str:
+    """Multiplie un masque par une luminosité pilotée image par image (color@name)."""
+    c, out = g.label(), g.label()
+    g.add(f"color@{name}=c=0x808080:s={w}x{h}:r={fps},format=gray[{c}];"
+          f"[{mask}][{c}]blend=all_mode=multiply:shortest=1[{out}]")
+    return out
+
+
+def outline(g: Graph, mask: str, n: int, fill: float) -> str:
+    """Contour lumineux (épaisseur n) et intérieur translucide d'un masque."""
+    a, b, c, e, d, f, out = (g.label() for _ in range(7))
+    g.add(f"[{mask}]split=3[{a}][{b}][{c}];[{b}]{','.join(['erosion'] * n)}[{e}];"
+          f"[{a}][{e}]blend=all_mode=difference[{d}];[{c}]lut=c0='val*{fill}'[{f}];"
+          f"[{d}][{f}]blend=all_mode=lighten[{out}]")
+    return out
+
+
+def smooth_cqt(n: int, SW: int, SH: int, s: dict, fps: int, decay: float, sigma: float) -> str:
+    """Spectre aux contours arrondis (pour des formes lisses plutôt que des barres)."""
+    return (f"{cqt_src(n, SH // 2, s, fps, decay)},scale={SW}:{SH}:flags=bicubic,"
+            f"gblur=sigma={sigma}:sigmaV={sigma / 2},lut=c0='if(gt(val,110),255,0)'")
+
+
+def layer_mandala(g: Graph, L: dict, s: dict, fps: int):
+    """Trois couronnes de pétales (basses, médiums, aigus) dessinées au trait lumineux ;
+    deux tournent en sens contraires, comme un kaléidoscope."""
+    U = L["U"]
+    S = even(2 * (L["r_out"] + U * 0.045))
+    k = min(1.0, 640 / S)                                   # calcul allégé, puis agrandi
+    SW_ = even(S * k)
+    r_in, depth = int(L["r_in"] * k), (L["r_out"] - L["r_in"]) * k
+    SH, NB = 256, 8
+    rings = [petal_maps(SW_, r_in, depth, 8, 1, SH, 0.0, 0.85),            # grands pétales : basses
+             petal_maps(SW_, r_in, depth * 0.72, 8, 3, SH, 0.5, 1.6),      # entre eux : médiums
+             petal_maps(SW_, r_in, depth * 0.42, 16, 6, SH, 0.25, 1.0)]    # petite couronne : aigus
+    xc, yc = radius_colors(SW_, r_in, depth, SH)
+    stops, _ = scheme_stops(s, L["cover"])
+    col = map_color_image(stops, True, 2, SH, xc, yc)       # couleur selon la distance au centre
+    th = max(4, round(SH * 0.035))                           # épaisseur du trait (dans le niveau)
+    a, a1, a2, b, sh, ln, fl, *rk = (g.label() for _ in range(10))
+    g.add(f"[0:a]{cqt_src(NB, SH, s, fps, 0.82)},split=3[{a1}][{a2}][{b}];"
+          f"[{b}]pad={NB}:{SH + th}:0:{th},crop={NB}:{SH}:0:0[{sh}];"
+          f"[{a1}][{sh}]blend=all_mode=difference[{ln}];"
+          f"[{a2}]lut=c0='val*0.21'[{fl}];[{ln}][{fl}]blend=all_mode=lighten,split=3"
+          + "".join(f"[{x}]" for x in rk))
+    t0, spin = L["t0"], (0.05, -0.08, 0.0)
+    parts = []
+    for k, (xm, ym) in enumerate(rings):
+        m = remap_mask(g, rk[k], xm, ym)
+        if spin[k]:
+            r = g.label()
+            g.add(f"[{m}]rotate=a='(t+{t0:.3f})*{spin[k]}':c=black[{r}]")
+            m = r
+        parts.append(m)
+    m01, m = g.label(), g.label()
+    g.add(f"[{parts[0]}][{parts[1]}]blend=all_mode=lighten[{m01}];"
+          f"[{m01}][{parts[2]}]blend=all_mode=lighten[{m}]")
+    out = colorize(g, dict(L, U=U * k), m, SW_, SW_, col)
+    if SW_ != S:
+        up = g.label()
+        g.add(f"[{out}]scale={S}:{S}:flags=bicubic[{up}]")
+        out = up
+    return out, L["fx"] - S // 2, L["fy"] - S // 2
+
+
+def layer_warp(g: Graph, L: dict, s: dict, fps: int):
+    W, H = L["W"], L["H"]
+    TW = even(min(W, 1280))
+    TH = even(TW * H / W)
+    sc = TW / W
+    A, K = 1024, 1024
+    xm, ym, xc, yc, lum = warp_maps(TW, TH, A, K, max(3.0, L["rc"] * sc * 0.6), L["fx"] * sc, L["fy"] * sc)
+    stops, _ = scheme_stops(s, L["cover"])
+    col = map_color_image(stops + [stops[0]], False, A, 2, xc, yc)   # couleur selon l'angle
+    pos = beat_positions(L, K / (3.4 * fps), 2.4)
+    cmds = frame_cmds(fps, ("crop@wz", "y", [int(p) % K for p in pos]), ("color@wg", "c", flash_values(L, 0.55)))
+    tex, lm = g.still(star_texture(A, K)), g.still(lum, "gray")
+    rc = L["rc"] * sc
+    hl = g.still(halo_image(TW, TH, L["fx"] * sc, L["fy"] * sc, rc, rc * 0.7, 0.42))
+    mx, my = g.still(xm), g.still(ym)
+    cr, m0, m1, m2 = g.label(), g.label(), g.label(), g.label()
+    g.add(f"[{tex}]sendcmd=f='{ffpath(cmds)}',crop@wz=w={A}:h={K}:x=0:y=0[{cr}];"
+          f"[{cr}][{mx}][{my}]remap=format=gray[{m0}];"
+          f"[{m0}][{lm}]blend=all_mode=multiply,lagfun=decay={0.55 ** (30 / fps):.3f}[{m2}];"
+          f"[{m2}][{hl}]blend=all_mode=lighten[{m1}]")
+    stars = colorize(g, dict(L, U=L["U"] * sc), flash(g, m1, TW, TH, fps, "wg"), TW, TH, col)
+    bk, out = g.label(), g.label()                           # fond assombri : les étoiles ressortent toujours
+    g.add(f"color=c=black@0.5:s={TW}x{TH}:r={fps},format=yuva420p[{bk}];"
+          f"[{bk}][{stars}]overlay=shortest=1:format=auto[{out}]")
+    if TW != W:
+        up = g.label()
+        g.add(f"[{out}]scale={W}:{H}:flags=bicubic[{up}]")
+        out = up
+    return out, 0, 0
+
+
+def layer_synthwave(g: Graph, L: dict, s: dict, fps: int):
+    sc = min(1.0, 1280 / L["W"])                            # calcul allégé, puis agrandi
+    W, H, U = even(L["W"] * sc), even(L["H"] * sc), L["U"] * sc
+    hz, rc, fy = even(L["hz"] * sc), L["rc"] * sc, L["fy"] * sc
+    nrows, MH = H - hz, even(min(U * 0.2, hz * 0.6))
+    y0 = even(max(0, min(hz - MH, fy - rc * 2.6)))          # le calque commence avec le halo du soleil
+    K, cell = 512, 0.118
+    strip, vl = synth_floor(W, nrows, K, cell, 12)
+    SW, SH = 512, 192
+    xm, ym = ridge_maps(W, MH, SW, SH)
+    stops, _ = scheme_stops(s, L["cover"])
+    grad = grad_image(stops, W, H - y0, True)
+    pos = beat_positions(L, K / (0.42 * fps), 1.6)
+    cmds = frame_cmds(fps, ("crop@fz", "x", [int(p) % K for p in pos]), ("color@sg", "c", flash_values(L, 0.62)))
+    st, v = g.still(strip), g.still(vl)
+    src, hl, fl2, mask, lit = (g.label() for _ in range(5))
+    quiet = dict(s, sensitivity=s["sensitivity"] - 60)            # de la marge : pas de plateaux
+    g.add(f"[0:a]{smooth_cqt(96, SW, SH, quiet, fps, 0.9, 3.5)}[{src}]")
+    mnt = outline(g, remap_mask(g, src, xm, ym), max(1, round(U / 450)), 0.22)
+    g.add(f"[{st}]sendcmd=f='{ffpath(cmds)}',crop@fz=w=1:h={nrows}:x=0:y=0,"
+          f"scale={W}:{nrows}:flags=neighbor[{hl}];[{hl}][{v}]blend=all_mode=lighten[{fl2}];"
+          f"[{mnt}][{fl2}]vstack,pad={W}:{H - y0}:0:{hz - MH - y0}:black[{mask}]")
+    halo = g.still(halo_image(W, H - y0, W / 2, fy - y0, rc, rc * 0.55, 0.5))
+    g.add(f"[{mask}][{halo}]blend=all_mode=lighten[{lit}]")
+    out = colorize(g, dict(L, U=U), flash(g, lit, W, H - y0, fps, "sg"), W, H - y0, grad)
+    oh = even((H - y0) / sc)
+    if sc < 1.0:
+        up = g.label()
+        g.add(f"[{out}]scale={L['W']}:{oh}:flags=bicubic[{up}]")
+        out = up
+    return out, 0, L["H"] - oh
+
 def visualizer(s: dict, W: int, vh: int, fps: int, keyed: bool) -> str:
     """Visualiseurs « classiques » (filtres ffmpeg directs)."""
     st, c = s["style"], ffcolor(s["color"])
@@ -1257,6 +1610,12 @@ def style_layer(g: Graph, L: dict, s: dict, fps: int, keyed: bool):
         return layer_aurora(g, L, s, fps)
     if st == "tunnel":
         return layer_tunnel(g, L, s, fps, keyed)
+    if st == "mandala":
+        return layer_mandala(g, L, s, fps)
+    if st == "warp":
+        return layer_warp(g, L, s, fps)
+    if st == "synthwave":
+        return layer_synthwave(g, L, s, fps)
     out = g.label()
     key = ",colorkey=black:0.12:0.08" if keyed else ""
     g.add(f"[0:a]{visualizer(s, L['W'], L['vh'], fps, keyed)},format=rgba{key}[{out}]")
@@ -1285,14 +1644,18 @@ def prepare(mp3: Path, s: dict, W: int, H: int, start: float, dur: float,
         spr = None
         if fpulse:
             spr, cw, ch, nc = front_sprite(L, 1 + 0.12 * pulse)
-        cmds = None
-        if fpulse or zoom:
+        cmds, env = None, []
+        beat = s["style"] in BEAT_STYLES
+        i0 = max(0, round((start - preroll) * fps))
+        if fpulse or zoom or beat:
             if env_all is not None:            # même calibrage pour toutes les parties
-                i0 = max(0, round((start - preroll) * fps))
                 env = env_all[i0:i0 + round((dur + preroll) * fps) + fps]
             else:
                 env = bass_envelope(mp3, fps, max(0.0, start - preroll), dur + preroll)
+        if fpulse or zoom:
             cmds = write_cmds(env, fps, nc if fpulse else 0, ch if fpulse else 0, nbz if zoom else 0, H)
+        L.update(env=env, i0=i0, t0=start - preroll, nfr=round((dur + preroll) * fps) + fps,
+                 E0=sum(env_all[:i0]) if (beat and env_all is not None) else 0.0)
 
         if zoom:
             base = g.still(bg_sprite(bg, W, H, nbz, 1 + 0.05 * pulse), "yuv420p")
@@ -1541,7 +1904,7 @@ def render_parts(parts: list[dict], audio_args: list[str], out: Path, total: flo
     nseg = len(parts)
     envs: dict[str, list[float]] = {}          # pulsation de chaque morceau, calculée une seule fois
     for p in parts:
-        if p["s"]["pulse"] > 0 and str(p["mp3"]) not in envs:
+        if (p["s"]["pulse"] > 0 or p["s"]["style"] in BEAT_STYLES) and str(p["mp3"]) not in envs:
             envs[str(p["mp3"])] = bass_envelope(p["mp3"], fps, 0.0, None)
     threads = str(max(1, (os.cpu_count() or 2) // workers))
     work = Path(tempfile.mkdtemp(prefix="parties_", dir=TMP))
@@ -2740,19 +3103,23 @@ const TOKEN = "__TOKEN__";
 const ticks = (n, r, lens) => Array.from({length:n},(_,i)=>{const a=i/n*2*Math.PI, l=lens[i%lens.length];
   return `<line x1="${(30+Math.sin(a)*r).toFixed(1)}" y1="${(17-Math.cos(a)*r).toFixed(1)}" x2="${(30+Math.sin(a)*(r+l)).toFixed(1)}" y2="${(17-Math.cos(a)*(r+l)).toFixed(1)}"/>`;}).join("");
 const STYLES = {
-  circle:["Cercle",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gc" x1="0" x2="1"><stop offset="0" stop-color="#00e5ff"/><stop offset="1" stop-color="#ff3df5"/></linearGradient></defs><g stroke="url(#gc)" stroke-width="2" stroke-linecap="round">'+ticks(18,8,[6,3,5,2,7,4])+'</g><circle cx="30" cy="17" r="6" fill="currentColor" opacity=".8"/></svg>',1],
-  retro:["Rétro LED",'<svg viewBox="0 0 60 34">'+[5,8,6,9,4,7,3,6].map((n,i)=>Array.from({length:n},(_,j)=>`<rect x="${4+i*6.8}" y="${30-j*3.3}" width="5" height="2.4" fill="${j>6?"#ff3d3d":j>4?"#ffd23d":"#22e05a"}"/>`).join("")).join("")+'</svg>',1],
-  mirror:["Miroir",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gm" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#ff3d00"/><stop offset="1" stop-color="#ffe14d"/></linearGradient></defs>'+[3,5,7,10,13,10,7,5,3].map((h,i)=>`<rect x="${4+i*6}" y="${21-h}" width="4.4" height="${h}" fill="url(#gm)"/><rect x="${4+i*6}" y="22" width="4.4" height="${h*0.5}" fill="url(#gm)" opacity=".4"/>`).join("")+'</svg>',1],
-  tunnel:["Tunnel",'<svg viewBox="0 0 60 34" fill="none" stroke="currentColor"><circle cx="30" cy="17" r="3" opacity=".9"/><circle cx="30" cy="17" r="7" opacity=".6"/><circle cx="30" cy="17" r="11.5" opacity=".4"/><circle cx="30" cy="17" r="16" opacity=".25"/><path d="M30 1 L30 33 M14 17 L46 17 M19 6 L41 28 M41 6 L19 28" opacity=".3"/></svg>',1],
-  cubes:["Cubes",'<svg viewBox="0 0 60 34">'+[.9,.3,.6,.2,.8,.4,.5,1,.3,.7,.2,.6,.4,.8,.5,.3,.9,.2].map((o,i)=>`<rect x="${6+(i%6)*8.2}" y="${3+Math.floor(i/6)*10}" width="7" height="8.6" rx="1" fill="#ff3d5a" opacity="${o}"/>`).join("")+'</svg>',1],
-  aurora:["Aurore",'<svg viewBox="0 0 60 34" fill="none" stroke-width="1.6" stroke-linecap="round"><path d="M2 20 C12 4 20 30 30 15 S48 6 58 18" stroke="#3dff7a"/><path d="M2 16 C14 26 22 6 32 19 S50 26 58 12" stroke="#00d5ff" opacity=".8"/><path d="M2 23 C10 12 24 26 34 10 S52 22 58 22" stroke="#b33dff" opacity=".7"/></svg>',1],
+  mandala:["Mandala",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff3df5"/><stop offset="1" stop-color="#00e5ff"/></linearGradient></defs><g fill="#ff3df5" fill-opacity=".15" stroke="url(#gd)" stroke-width="1.1">'+Array.from({length:8},(_,i)=>`<ellipse cx="30" cy="8" rx="3.4" ry="7.2" transform="rotate(${i*45} 30 17)"/>`).join("")+'</g><g fill="none" stroke="#00e5ff" stroke-width=".9" opacity=".8">'+Array.from({length:8},(_,i)=>`<ellipse cx="30" cy="11" rx="2.2" ry="4.4" transform="rotate(${i*45+22.5} 30 17)"/>`).join("")+'</g><circle cx="30" cy="17" r="4" fill="currentColor"/></svg>',1],
+  synthwave:["Horizon néon",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gs" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd23d"/><stop offset="1" stop-color="#ff3df5"/></linearGradient></defs><circle cx="30" cy="11.5" r="7" fill="url(#gs)"/><path d="M1 19 L5 15 L8 16.5 L12 11 L16 15 L21 18.5 M39 18.5 L44 15 L48 11.5 L52 16 L55 14 L59 19" fill="none" stroke="#b33dff" stroke-width="1.1"/><g stroke="#00e5ff" stroke-width=".8"><path d="M0 19.5 H60" stroke-width="1.1"/><path d="M0 21.5 H60 M0 24.5 H60 M0 28.5 H60 M0 33.5 H60" opacity=".75"/>'+[-5,-3,-1.6,-.5,.5,1.6,3,5].map(d=>`<path d="M${(30+d*3).toFixed(1)} 19.5 L${(30+d*12).toFixed(1)} 34" opacity=".75"/>`).join("")+'</g></svg>',1],
+  warp:["Hyperespace",'<svg viewBox="0 0 60 34" stroke-linecap="round">'+Array.from({length:18},(_,i)=>{const a=i/18*2*Math.PI+.3, r1=6+(i%3)*2.2, r2=r1+4+(i%4)*2.6; return `<line x1="${(30+Math.cos(a)*r1).toFixed(1)}" y1="${(17+Math.sin(a)*r1*.8).toFixed(1)}" x2="${(30+Math.cos(a)*r2).toFixed(1)}" y2="${(17+Math.sin(a)*r2*.8).toFixed(1)}" stroke="${["#00e5ff","#7a5cff","#ff3df5"][i%3]}" stroke-width="1.2"/>`;}).join("")+'<circle cx="30" cy="17" r="3.8" fill="currentColor"/></svg>',1],
+  circle:["Cercle",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gc" x1="0" x2="1"><stop offset="0" stop-color="#00e5ff"/><stop offset="1" stop-color="#ff3df5"/></linearGradient></defs><g stroke="url(#gc)" stroke-width="2" stroke-linecap="round">'+ticks(18,8,[6,3,5,2,7,4])+'</g><circle cx="30" cy="17" r="6" fill="currentColor" opacity=".8"/></svg>',],
+  retro:["Rétro LED",'<svg viewBox="0 0 60 34">'+[5,8,6,9,4,7,3,6].map((n,i)=>Array.from({length:n},(_,j)=>`<rect x="${4+i*6.8}" y="${30-j*3.3}" width="5" height="2.4" fill="${j>6?"#ff3d3d":j>4?"#ffd23d":"#22e05a"}"/>`).join("")).join("")+'</svg>',],
+  mirror:["Miroir",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gm" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#ff3d00"/><stop offset="1" stop-color="#ffe14d"/></linearGradient></defs>'+[3,5,7,10,13,10,7,5,3].map((h,i)=>`<rect x="${4+i*6}" y="${21-h}" width="4.4" height="${h}" fill="url(#gm)"/><rect x="${4+i*6}" y="22" width="4.4" height="${h*0.5}" fill="url(#gm)" opacity=".4"/>`).join("")+'</svg>',],
+  tunnel:["Tunnel",'<svg viewBox="0 0 60 34" fill="none" stroke="currentColor"><circle cx="30" cy="17" r="3" opacity=".9"/><circle cx="30" cy="17" r="7" opacity=".6"/><circle cx="30" cy="17" r="11.5" opacity=".4"/><circle cx="30" cy="17" r="16" opacity=".25"/><path d="M30 1 L30 33 M14 17 L46 17 M19 6 L41 28 M41 6 L19 28" opacity=".3"/></svg>',],
+  cubes:["Cubes",'<svg viewBox="0 0 60 34">'+[.9,.3,.6,.2,.8,.4,.5,1,.3,.7,.2,.6,.4,.8,.5,.3,.9,.2].map((o,i)=>`<rect x="${6+(i%6)*8.2}" y="${3+Math.floor(i/6)*10}" width="7" height="8.6" rx="1" fill="#ff3d5a" opacity="${o}"/>`).join("")+'</svg>',],
+  aurora:["Aurore",'<svg viewBox="0 0 60 34" fill="none" stroke-width="1.6" stroke-linecap="round"><path d="M2 20 C12 4 20 30 30 15 S48 6 58 18" stroke="#3dff7a"/><path d="M2 16 C14 26 22 6 32 19 S50 26 58 12" stroke="#00d5ff" opacity=".8"/><path d="M2 23 C10 12 24 26 34 10 S52 22 58 22" stroke="#b33dff" opacity=".7"/></svg>',],
   cqt:["Barres piano",'<svg viewBox="0 0 60 34"><defs><linearGradient id="g1" x1="0" x2="1"><stop offset="0" stop-color="#ff3d6e"/><stop offset=".5" stop-color="#ffd23d"/><stop offset="1" stop-color="#3dd5ff"/></linearGradient></defs>'+[6,14,22,11,27,18,9,24,15,7,20,12].map((h,i)=>`<rect x="${2+i*4.8}" y="${32-h}" width="3.4" height="${h}" rx="1" fill="url(#g1)"/>`).join("")+'</svg>'],
   bars:["Égaliseur",'<svg viewBox="0 0 60 34">'+[10,20,28,22,16,24,12,18,8,14].map((h,i)=>`<rect x="${3+i*5.6}" y="${32-h}" width="4" height="${h}" rx="1" fill="currentColor" opacity=".85"/>`).join("")+'</svg>'],
   waves:["Onde",'<svg viewBox="0 0 60 34"><path d="M2 17 Q6 4 10 17 T18 17 T26 17 Q30 28 34 17 T42 17 Q46 8 50 17 T58 17" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>'],
   spectrum:["Spectrogramme",'<svg viewBox="0 0 60 34"><defs><linearGradient id="g2" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#2a0a5e"/><stop offset=".5" stop-color="#e0407a"/><stop offset="1" stop-color="#ffe08a"/></linearGradient></defs>'+Array.from({length:14},(_,i)=>`<rect x="${2+i*4}" y="${4+((i*7)%9)}" width="3.6" height="${28-((i*7)%9)}" fill="url(#g2)" opacity="${.45+((i*3)%5)/9}"/>`).join("")+'</svg>'],
   scope:["Oscilloscope",'<svg viewBox="0 0 60 34"><path d="M30 4 C44 4 44 30 30 30 C16 30 16 4 30 4 Z M22 10 L38 24 M38 10 L22 24" fill="none" stroke="currentColor" stroke-width="1.8" opacity=".85"/></svg>']
 };
-const MASK = ["circle","retro","mirror","cubes","aurora"], ROUND = ["circle","tunnel"], CQT = ["circle","retro","mirror","cubes"];
+const MASK = ["circle","retro","mirror","cubes","aurora","mandala","synthwave","warp"],
+      ROUND = ["circle","tunnel","mandala","synthwave","warp"], CQT = ["circle","retro","mirror","cubes","mandala","synthwave"];
 let S = null, settings = null, checked = new Set(), seen = new Set(), selected = null, saveT = null, lastImgs = "", cvName = null;
 let globalSet = null, tracks = {}, pendingSave = null;   // réglages communs / propres à certains morceaux
 let order = [], mixOn = false;                           // une seule vidéo : ordre des morceaux
@@ -2818,7 +3185,8 @@ function applySettings(){
   $("#o-size").textContent = (!rnd && settings.viz_size >= 100) ? "Plein" : settings.viz_size + " %";
   $("#o-sens").textContent = settings.sensitivity + " %";
   $("#o-pulse").textContent = settings.pulse ? settings.pulse + " %" : "Aucune";
-  $("#l-size").textContent = rnd ? "Taille du cercle" : "Taille";
+  $("#l-size").textContent = !rnd ? "Taille" : sts.every(x => x === "synthwave") ? "Taille du soleil"
+                            : sts.every(x => ["synthwave","warp"].includes(x)) ? "Taille de la jaquette" : "Taille du cercle";
   const solid = ["solid","duo"].includes(settings.colors);
   $("#r-scheme").classList.toggle("hide", !mask);
   $("#r-color").classList.toggle("hide", !(sts.some(x => ["waves","bars","scope"].includes(x)) || (mask && solid)));
