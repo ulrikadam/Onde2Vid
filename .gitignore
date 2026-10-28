@@ -44,6 +44,7 @@ htmlcov/
 input/
 output/
 reglages.json
+reglages_morceaux.json
 
 # Médias : ne jamais publier vos morceaux ni vidéos par erreur
 *.mp3
