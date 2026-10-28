@@ -145,6 +145,7 @@ DEFAULTS = {
     "preset": "veryfast",     # vitesse d'encodage
     "compression": "fast",    # fast : puce graphique si possible ; compact : processeur (libx264)
     "audio_kbps": 320,
+    "same_for_all": True,     # mêmes réglages pour toute la playlist (sinon : réglages de chaque morceau)
     "rotate": False,          # changer de visualiseur pendant le morceau
     "rotate_styles": [],      # visualiseurs qui alternent (au moins 2)
     "rotate_minutes": 10,     # durée de chaque visualiseur
@@ -337,6 +338,7 @@ def clean_settings(raw) -> dict:
     s["compression"] = _pick(s["compression"], ["fast", "compact"], "fast")
     s["audio_kbps"] = _pick(s["audio_kbps"], [192, 256, 320], 320)
     s["rotate"] = bool(s["rotate"])
+    s["same_for_all"] = bool(s["same_for_all"])
     rs = s["rotate_styles"] if isinstance(s["rotate_styles"], list) else []
     s["rotate_styles"] = list(dict.fromkeys(st for st in rs if st in STYLES))
     s["rotate_minutes"] = _pick(s["rotate_minutes"], ROTATE_MINUTES, 10)
@@ -1762,7 +1764,7 @@ def app_state() -> dict:
     files = []
     for f in list_mp3():
         info = probe(f)
-        p, src = cover_source(f, SETTINGS)
+        p, src = cover_source(f, settings_for(f.name))
         files.append({"name": f.name, "duration": info["duration"], "cover_src": src,
                       "cover_v": short_hash(src, file_key(p))[:8],
                       "tag": f"{info['artist']} – {info['title']}".strip(" –") if info["title"] else "",
@@ -1780,6 +1782,13 @@ def app_state() -> dict:
 TOKEN = secrets.token_hex(16)
 SETTINGS = load_settings()
 TRACK_SETTINGS = load_track_settings()   # nom du fichier → réglages propres
+
+
+def settings_for(name: str) -> dict:
+    """Réglages utilisés pour un morceau (les siens si la playlist n'a pas des réglages communs)."""
+    if not SETTINGS["same_for_all"] and name in TRACK_SETTINGS:
+        return TRACK_SETTINGS[name]
+    return SETTINGS
 SERVER: ThreadingHTTPServer | None = None
 ALLOWED_HOSTS: set[str] = set()
 ACTIVITY = {"seen": time.monotonic(), "bye": 0.0}   # dernière visite de la page / onglet fermé
@@ -1855,7 +1864,7 @@ class Handler(BaseHTTPRequestHandler):
             size = _clamp_int(q.get("s", ["160"])[0], 40, 600, 160)
             try:
                 with ASSET_LOCK:
-                    img, _ = track_cover(mp3, SETTINGS) if mp3.is_file() else (None, "")
+                    img, _ = track_cover(mp3, settings_for(mp3.name)) if mp3.is_file() else (None, "")
                     t = thumb(img, size) if img else None
             except RuntimeError:
                 t = None
@@ -1944,7 +1953,7 @@ class Handler(BaseHTTPRequestHandler):
             names = [Path(str(n)).name for n in data.get("files", []) if Path(str(n)).suffix.lower() in AUDIO_EXT]
             if not names:
                 return self._json({"ok": False, "error": "Aucun morceau sélectionné"})
-            per = {n: dict(TRACK_SETTINGS.get(n) or SETTINGS) for n in names}   # réglages de chaque morceau
+            per = {n: dict(settings_for(n)) for n in names}   # réglages de chaque morceau
             err = QUEUE.start(names, per, bool(data.get("force")))
             self._json({"ok": err is None, "error": err})
         elif url.path == "/api/cancel":
@@ -1974,7 +1983,7 @@ class Handler(BaseHTTPRequestHandler):
                     elif act == "embed":
                         if QUEUE.running:
                             raise RuntimeError("Attends la fin de la conversion en cours")
-                        embed_cover(mp3, SETTINGS)
+                        embed_cover(mp3, settings_for(mp3.name))
                     elif act == "use":
                         img = INPUT_DIR / Path(str(data.get("image", ""))).name
                         if not (img.is_file() and img.suffix.lower() in IMAGE_EXT):
@@ -2250,7 +2259,8 @@ def run_batch(force: bool) -> None:
             print(f"\r[{i}/{len(files)}] {name}  {p:5.1f} %  {sp}   ", end="", flush=True)
 
         try:
-            convert_one(mp3, tracks.get(mp3.name) or s, out, on_progress=show)
+            own = None if s["same_for_all"] else tracks.get(mp3.name)
+            convert_one(mp3, own or s, out, on_progress=show)
             print(f"\r[{i}/{len(files)}] {mp3.name}  ✓" + " " * 20)
             ok += 1
         except RuntimeError as e:
@@ -2339,6 +2349,8 @@ main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:18px;
 .scope b{font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .rotbox{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:-4px 0 14px}
 .rotbox .hint{flex-basis:100%;font-size:12.5px;color:var(--muted)}
+.samebar{display:flex;align-items:center;margin:2px 0 8px}
+.mycv{display:flex;align-items:center;gap:10px;min-width:0}.mycv span{flex:1;min-width:0;font-size:12.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tag.own{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent)}
 .sect{border-top:1px solid var(--line);padding-top:12px;margin-top:6px}
 .sect h3{font-size:12px;margin:0 0 8px;color:var(--muted);font-weight:600}
@@ -2423,8 +2435,9 @@ input[type=range]{width:100%;accent-color:var(--accent)}
           <button class="btn small" id="openIn">Dossier input</button>
           <button class="btn small" id="openOut">Dossier output</button>
         </div>
+        <div class="samebar"><label class="check"><input type="checkbox" id="same"><span>Mêmes réglages pour toute la playlist</span></label></div>
         <div class="files" id="files"></div>
-        <p class="hint">Clique sur la case <b>+</b> d'un morceau (ou glisse une image dessus) pour lui ajouter une jaquette.</p>
+        <p class="hint" id="filesHint"></p>
       </div>
     </div>
 
@@ -2495,6 +2508,8 @@ input[type=range]{width:100%;accent-color:var(--accent)}
           <h3>Jaquette et fond</h3>
           <div class="grid2">
             <div>
+              <div class="row"><label>Jaquette de ce morceau</label>
+                <div class="mycv"><button class="thumb" id="myCv" title="Changer la jaquette de ce morceau"></button><span id="myCvTxt"></span><button class="btn small" id="myCvBtn">Changer…</button></div></div>
               <div class="row"><label>Jaquette au centre</label>
                 <select data-k="layout">
                   <option value="auto">Automatique</option>
@@ -2502,7 +2517,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
                   <option value="round">Ronde</option>
                   <option value="fill">Aucune (image plein écran)</option>
                 </select></div>
-              <div class="row"><label>Si le morceau n'en a pas</label>
+              <div class="row" title="Utilisée pour les morceaux qui n'ont pas de jaquette"><label>Jaquette par défaut (morceaux sans jaquette)</label>
                 <div class="inline"><select data-k="cover_default" id="defSel"></select><label class="btn small" title="Importer une image">Importer…<input type="file" id="defPick" accept="image/*" hidden></label></div></div>
             </div>
             <div>
@@ -2683,9 +2698,13 @@ function applySettings(){
   $("#r-pulsebg").classList.toggle("hide", !settings.pulse);
   $("#titleSel").value = settings.title ? settings.title_src : "none";
 }
-function curTrack(){ return selected && tracks[selected] ? selected : null; }
+const same = () => !globalSet || globalSet.same_for_all;
+function curTrack(){ return !same() && selected && tracks[selected] ? selected : null; }
 function changed(){
   clearTimeout(saveT);
+  if (!same() && selected && settings !== globalSet && !tracks[selected]){   // 1re modification : le morceau garde ses réglages
+    tracks[selected] = settings; renderFiles();
+  }
   const obj = settings, track = curTrack();
   pendingSave = () => { pendingSave = null; return post("/api/settings",{settings: obj, track}); };
   saveT = setTimeout(pendingSave, 350);
@@ -2693,15 +2712,29 @@ function changed(){
 }
 async function flushSave(){ clearTimeout(saveT); if (pendingSave) await pendingSave(); }
 function useSettingsFor(){                 // le panneau montre les réglages du morceau choisi
-  settings = curTrack() ? tracks[selected] : globalSet;
-  lastImgs = ""; fillImages(); applySettings(); renderScope();
+  if (same() || !selected) settings = globalSet;
+  else settings = tracks[selected] || JSON.parse(JSON.stringify(globalSet));   // brouillon tant qu'on ne change rien
+  $("#same").checked = same();
+  $("#filesHint").textContent = same()
+    ? "Décoche la case ci-dessus pour régler chaque morceau séparément (visualiseur, jaquette, fond…). Clique sur la vignette d'un morceau pour changer sa jaquette."
+    : "Clique sur un morceau : les réglages à droite ne concernent que lui. Clique sur sa vignette pour changer sa jaquette.";
+  lastImgs = ""; fillImages(); applySettings(); renderScope(); renderMyCover();
 }
 function renderScope(){
-  const own = !!curTrack(), box = $("#scope"), b = $("#scopeBtn"), t = $("#scopeTxt");
-  box.classList.toggle("own", own); t.innerHTML = "";
-  if (own){ t.append("Réglages propres à "); t.appendChild(el("b",null,selected)); b.textContent = "Revenir aux réglages communs"; }
-  else { t.textContent = "Réglages communs à tous les morceaux"; b.textContent = "Réglages propres à ce morceau"; }
-  b.disabled = !selected;
+  const per = !same() && selected, own = !!curTrack(), box = $("#scope"), b = $("#scopeBtn"), t = $("#scopeTxt");
+  box.classList.toggle("own", !!per); t.innerHTML = "";
+  if (per){ t.append("Réglages de "); t.appendChild(el("b",null,selected)); if (!own) t.append(" (encore identiques aux réglages communs)"); }
+  else t.textContent = "Réglages communs à toute la playlist";
+  b.textContent = "Reprendre les réglages communs"; b.hidden = !own;
+}
+const CVTXT = {added:"Ajoutée", image:"Image du même nom", mp3:"Celle du fichier", default:"Par défaut"};
+function renderMyCover(){
+  const f = S && S.files.find(x => x.name === selected), th = $("#myCv");
+  th.innerHTML = ""; th.className = "thumb" + (f && f.cover_src ? " has" : "");
+  if (f && f.cover_src){ const im = el("img"); im.alt = ""; im.src = `/api/thumb?name=${enc(f.name)}&v=${f.cover_v}`; th.appendChild(im); }
+  else th.textContent = "+";
+  $("#myCvTxt").textContent = !f ? "Choisis un morceau" : (CVTXT[f.cover_src] || "Aucune");
+  th.disabled = $("#myCvBtn").disabled = !f;
 }
 function rotHint(){
   const n = settings.rotate_styles.length;
@@ -2772,7 +2805,7 @@ function renderFiles(){
     const name = el("div","fname",f.name); name.title = f.name;
     if (f.tag) name.appendChild(el("small",null,f.tag));
     const meta = el("div","fmeta");
-    if (tracks[f.name]) meta.appendChild(el("span","tag own","réglages perso"));
+    if (!same() && tracks[f.name]) meta.appendChild(el("span","tag own","réglages perso"));
     if (f.cover_src && f.cover_src !== "default") meta.appendChild(el("span","tag",SRC[f.cover_src]));
     meta.appendChild(el("span",null,fmt(f.duration)));
     if (f.done){
@@ -2799,7 +2832,7 @@ function renderFiles(){
     box.appendChild(row);
   }
   $("#count").textContent = S.files.length + " fichier" + (S.files.length > 1 ? "s" : "");
-  updateAction(); updatePvLabel();
+  updateAction(); updatePvLabel(); renderMyCover();
   if (cvName) renderCover();
 }
 function updateAction(){
@@ -2940,22 +2973,25 @@ $("#preview").onclick = preview;
 $("#reset").onclick = () => {
   if (!confirm("Remettre les réglages par défaut ?")) return;
   const d = JSON.parse(JSON.stringify(DEFAULTS));
-  if (curTrack()) tracks[selected] = d; else globalSet = d;
+  if (curTrack()) tracks[selected] = d; else { d.same_for_all = same(); globalSet = d; }
   settings = d; applySettings(); changed();
 };
 $("#scopeBtn").onclick = async () => {
   if (!selected) return;
   await flushSave();
-  if (curTrack()){
-    if (!confirm(`« ${selected} » utilisera de nouveau les réglages communs. Ses réglages propres seront effacés.`)) return;
-    const r = await post("/api/track",{name: selected, action: "drop"});
-    if (r.ok) delete tracks[selected];
-  } else {
-    const r = await post("/api/track",{name: selected, action: "make", settings: globalSet});
-    if (r.ok) tracks[selected] = r.tracks[selected];
-  }
+  if (!curTrack()) return;
+  if (!confirm(`« ${selected} » reprendra les réglages communs. Ses réglages à lui seront effacés.`)) return;
+  const r = await post("/api/track",{name: selected, action: "drop"});
+  if (r.ok) delete tracks[selected];
   useSettingsFor(); renderFiles();
 };
+$("#same").onchange = async e => {
+  await flushSave();
+  globalSet.same_for_all = e.target.checked;
+  await post("/api/settings",{settings: globalSet});
+  useSettingsFor(); renderFiles();
+};
+$("#myCv").onclick = $("#myCvBtn").onclick = () => { if (selected) openCover(selected); };
 $("#cancel").onclick = () => post("/api/cancel").then(() => refresh(true));
 $("#go").onclick = async () => {
   const files = S.files.filter(f => checked.has(f.name)).map(f => f.name);
