@@ -23,6 +23,10 @@ Avec Onde2Vid, vous pouvez :
 - exporter au format paysage (16:9), vertical (9:16) ou carré (1:1) ;
 - générer une vidéo en 720p, 1080p, 1440p ou 4K ;
 - prévisualiser un extrait avant de lancer la conversion complète ;
+- réunir plusieurs morceaux dans **une seule vidéo**, dans l’ordre de votre choix : chaque titre s’affiche au bon moment et les chapitres YouTube sont prêts à copier ;
+- donner à chaque morceau ses propres réglages (visualiseur, jaquette, titre…), ou garder les mêmes pour toute la playlist ;
+- faire alterner plusieurs visualiseurs pendant un long morceau (toutes les 1 à 30 minutes) ;
+- convertir plus vite : les longs morceaux sont calculés en plusieurs parties en même temps, et la compression peut passer par la puce graphique sur Mac (réglage « Rapide ») ;
 - convertir tout le dossier en mode batch, sans interface.
 
 ## Version autonome (sans Python)
@@ -52,7 +56,7 @@ Les versions Mac sont signées et notarisées par Apple (plus aucun blocage à l
 Pour utiliser directement le script Python (au lieu de la version autonome) :
 
 - Python 3.9 ou une version plus récente
-- [FFmpeg](https://ffmpeg.org/), avec l’encodeur vidéo `libx264`
+- [FFmpeg](https://ffmpeg.org/), avec l’encodeur vidéo `libx264` (sur Mac, l’encodeur `h264_videotoolbox` de la puce graphique est utilisé s’il est disponible)
 
 Aucune bibliothèque Python supplémentaire n’est requise.
 
@@ -100,6 +104,20 @@ Lancé de cette façon, Onde2Vid s’arrête tout seul une vingtaine de secondes
 
 Déposez vos morceaux dans l’interface, choisissez vos réglages, puis cliquez sur **Convertir**.
 
+### Réglages de chaque morceau
+
+La case **« Mêmes réglages pour toute la playlist »**, au-dessus de la liste, est cochée par défaut. Décochez-la pour régler chaque morceau séparément : cliquez sur un morceau, puis changez son visualiseur, sa jaquette ou son titre. Le bouton « Reprendre les réglages communs » annule les réglages propres au morceau sélectionné.
+
+Pour les longs morceaux, cochez **« Changer de visualiseur pendant le morceau »**, choisissez plusieurs visualiseurs et la durée de chacun : la vidéo passe de l’un à l’autre avec un court fondu.
+
+### Une seule vidéo avec plusieurs morceaux
+
+1. Cochez les morceaux à réunir.
+2. En bas, cochez **« Une seule vidéo avec les morceaux cochés »** et donnez un nom à la vidéo.
+3. Réglez l’ordre avec les flèches ▲▼, puis cliquez sur **Créer 1 vidéo**.
+
+Le son s’enchaîne sans coupure. Chaque passage garde son titre, sa jaquette et son visualiseur ; le format, la résolution et la qualité sont les mêmes pour toute la vidéo. Les chapitres sont intégrés au MP4, et un fichier texte du même nom est créé à côté (par exemple `0:00 Titre 1`, `5:02 Titre 2`…) : collez-le dans la description YouTube pour obtenir les chapitres (YouTube en demande au moins trois de 10 secondes ou plus).
+
 ## Organisation des fichiers
 
 Ces dossiers sont créés automatiquement à côté du script :
@@ -109,8 +127,9 @@ Onde2Vid/
 ├── Onde2Vid.py
 ├── input/                 # vos fichiers audio et éventuelles images de fond
 │   └── jaquettes/         # jaquettes ajoutées depuis l’interface
-├── output/                # vidéos MP4 générées
-└── reglages.json          # derniers réglages utilisés
+├── output/                # vidéos MP4 générées (et chapitres .txt des compilations)
+├── reglages.json          # derniers réglages utilisés
+└── reglages_morceaux.json # réglages propres à certains morceaux
 ```
 
 Pour chaque morceau, la jaquette est choisie dans cet ordre :
