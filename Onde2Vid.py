@@ -1266,7 +1266,7 @@ def style_layer(g: Graph, L: dict, s: dict, fps: int, keyed: bool):
 def prepare(mp3: Path, s: dict, W: int, H: int, start: float, dur: float,
             preroll: float = 0.0, final: bool = False, env_all: list[float] | None = None,
             fade_in: bool = True, fade_out: bool = True,
-            trans_in: bool = False, trans_out: bool = False) -> Graph:
+            trans_in: bool = False, trans_out: bool = False, pad_end: bool = False) -> Graph:
     """Prépare toutes les images et renvoie le graphe de filtres complet.
     Les temps du graphe commencent à 0 au début du passage lu (start - preroll).
     env_all : pulsation déjà calculée sur tout le morceau (conversion en plusieurs parties)."""
@@ -1351,6 +1351,8 @@ def prepare(mp3: Path, s: dict, W: int, H: int, start: float, dur: float,
             tail.append(f"fade=t=in:st=0:d={TRANS_D}")
         if trans_out and dur > TRANS_D:
             tail.append(f"fade=t=out:st={dur - TRANS_D:.3f}:d={TRANS_D}")
+        if pad_end:                            # quelques images de réserve si le son finit un peu tôt
+            tail.append("tpad=stop_mode=clone:stop=3")
         tail.append("format=yuv420p")
         g.add(f"[{cur}]{','.join(tail)}[v]")
         return g
@@ -1511,24 +1513,36 @@ def _run_ff(cmd: list[str], group: _ProcGroup, on_time=None) -> None:
             raise RuntimeError(last_line(errlog.read(), f"ffmpeg a échoué (code {rc})"))
 
 
-def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
-                     plan: list[tuple[float, float, str]], on_progress=None, set_proc=None) -> None:
-    """Long morceau : découpé en parties calculées en même temps, puis recollées sans
-    recompression ; le son est encodé une seule fois pour éviter tout raccord audible."""
-    ff, fps = TOOLS["ffmpeg"], s["fps"]
-    W, H = frame_size(s)
-    frames = math.ceil(dur * fps)
-    want = max(workers, math.ceil(dur / SEGMENT_TARGET))
-    parts = []        # (1re image, image de fin, visualiseur, fondu d'entrée, fondu de sortie)
+def track_parts(mp3: Path, s: dict, dur: float, nframes: int, want: int) -> list[dict]:
+    """Parties d'un morceau (images comptées depuis le début du morceau), selon ses visualiseurs."""
+    fps = s["fps"]
+    plan = style_plan(s, dur, mp3.name)
+    parts = []
     for bi, (t0, t1, st) in enumerate(plan):
         a0 = round(t0 * fps) if bi else 0
-        b0 = frames if bi == len(plan) - 1 else round(t1 * fps)
-        n = max(1, round(want * (b0 - a0) / frames), math.ceil((b0 - a0) / fps / SEGMENT_TARGET))
+        b0 = nframes if bi == len(plan) - 1 else min(nframes, round(t1 * fps))
+        if b0 <= a0:
+            continue
+        n = max(1, round(want * (b0 - a0) / nframes), math.ceil((b0 - a0) / fps / SEGMENT_TARGET))
         cuts = [a0 + round(k * (b0 - a0) / n) for k in range(n + 1)]
         for k in range(n):
-            parts.append((cuts[k], cuts[k + 1], st, k == 0 and bi > 0, k == n - 1 and bi < len(plan) - 1))
+            parts.append({"mp3": mp3, "s": dict(s, style=st), "a": cuts[k], "b": cuts[k + 1],
+                          "tin": k == 0 and bi > 0, "tout": k == n - 1 and bi < len(plan) - 1})
+    return parts
+
+
+def render_parts(parts: list[dict], audio_args: list[str], out: Path, total: float, workers: int,
+                 on_progress=None, set_proc=None, chapters: Path | None = None) -> None:
+    """Calcule les parties en même temps, puis les recolle sans recompression avec le son,
+    encodé une seule fois pour éviter tout raccord audible."""
+    s0 = parts[0]["s"]
+    ff, fps = TOOLS["ffmpeg"], s0["fps"]
+    W, H = frame_size(s0)
     nseg = len(parts)
-    env_all = bass_envelope(mp3, fps, 0.0, None) if s["pulse"] > 0 else None
+    envs: dict[str, list[float]] = {}          # pulsation de chaque morceau, calculée une seule fois
+    for p in parts:
+        if p["s"]["pulse"] > 0 and str(p["mp3"]) not in envs:
+            envs[str(p["mp3"])] = bass_envelope(p["mp3"], fps, 0.0, None)
     threads = str(max(1, (os.cpu_count() or 2) // workers))
     work = Path(tempfile.mkdtemp(prefix="parties_", dir=TMP))
     group = _ProcGroup()
@@ -1542,28 +1556,28 @@ def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
         with plock:
             done[k] = sec
             made, el = sum(done), time.monotonic() - t0
-        on_progress(min(98.0, made / dur * 98), f"{made / el:.2f}x" if el > 2 else "")
+        on_progress(min(98.0, made / total * 98), f"{made / el:.2f}x" if el > 2 else "")
 
     def audio_task() -> None:
-        _run_ff(base + ["-i", str(mp3), "-vn", "-c:a", "aac", "-b:a", f"{s['audio_kbps']}k",
-                        "-t", f"{dur:.3f}", str(work / "son.m4a")], group)
+        _run_ff(base + audio_args + [str(work / "son.m4a")], group)
 
     def part_task(k: int) -> None:
         if group.stopped:
             raise RuntimeError("Conversion arrêtée")
-        a, b, st, tin, tout = parts[k]
-        sp = dict(s, style=st)
+        p = parts[k]
+        mp3, sp, a, b = p["mp3"], p["s"], p["a"], p["b"]
         start, length = a / fps, (b - a) / fps
-        pre_s = {"spectrum": 12.0, "tunnel": 2.5}.get(st, 2.0)          # mise en route des effets
+        pre_s = {"spectrum": 12.0, "tunnel": 2.5}.get(sp["style"], 2.0)   # mise en route des effets
         pre = min(round(pre_s * fps), a) / fps
-        g = prepare(mp3, sp, W, H, start, length, preroll=pre, final=True, env_all=env_all,
-                    fade_in=k == 0, fade_out=k == nseg - 1, trans_in=tin, trans_out=tout)
+        g = prepare(mp3, sp, W, H, start, length, preroll=pre, final=True, env_all=envs.get(str(mp3)),
+                    fade_in=k == 0, fade_out=k == nseg - 1, trans_in=p["tin"], trans_out=p["tout"],
+                    pad_end=True)
         cmd = list(base)
         if start - pre > 0:
             cmd += ["-ss", f"{start - pre:.6f}"]
         cmd += ["-t", f"{length + pre + 1:.6f}", "-i", str(mp3), *_inputs(g),
                 "-filter_complex", g.text(), "-map", "[v]", "-an",
-                *video_args(s, W, H), "-threads", threads,
+                *video_args(sp, W, H), "-threads", threads,
                 "-frames:v", str(b - a), str(work / f"partie{k:03d}.mp4")]
         _run_ff(cmd, group, lambda sec: progress(k, min(length, sec)))
         progress(k, length)
@@ -1584,10 +1598,12 @@ def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
         lst.write_text("".join(f"file 'partie{k:03d}.mp4'\n" for k in range(nseg)), encoding="utf-8")
         out.parent.mkdir(parents=True, exist_ok=True)
         part = out.with_name("." + out.stem + ".part.mp4")
+        cmd = base + ["-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(work / "son.m4a")]
+        if chapters:
+            cmd += ["-f", "ffmetadata", "-i", str(chapters), "-map_chapters", "2"]
+        cmd += ["-map", "0:v", "-map", "1:a", "-c", "copy", "-movflags", "+faststart", str(part)]
         try:
-            _run_ff(base + ["-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(work / "son.m4a"),
-                            "-map", "0:v", "-map", "1:a", "-c", "copy", "-movflags", "+faststart",
-                            str(part)], group)
+            _run_ff(cmd, group)
         except BaseException:
             part.unlink(missing_ok=True)
             raise
@@ -1597,6 +1613,15 @@ def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
         if set_proc:
             set_proc(None)
         shutil.rmtree(work, ignore_errors=True)
+
+
+def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
+                     on_progress=None, set_proc=None) -> None:
+    """Long morceau (ou visualiseurs qui alternent) : découpé en parties calculées en même temps."""
+    frames = math.ceil(dur * s["fps"])
+    parts = track_parts(mp3, s, dur, frames, max(workers, math.ceil(dur / SEGMENT_TARGET)))
+    audio = ["-i", str(mp3), "-vn", "-c:a", "aac", "-b:a", f"{s['audio_kbps']}k", "-t", f"{dur:.3f}"]
+    render_parts(parts, audio, out, dur, workers, on_progress, set_proc)
 
 
 def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) -> None:
@@ -1613,7 +1638,7 @@ def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) 
     plan = style_plan(s, dur, mp3.name)
     workers = parallel_workers(s, W, H)
     if len(plan) > 1 or (dur >= PARALLEL_MIN and workers > 1):
-        return convert_parallel(mp3, s, out, dur, workers, plan, on_progress, set_proc)
+        return convert_parallel(mp3, s, out, dur, workers, on_progress, set_proc)
     s = dict(s, style=plan[0][2])
     g = prepare(mp3, s, W, H, 0.0, dur, final=True)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -1649,6 +1674,73 @@ def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) 
             errlog.seek(0)
             raise RuntimeError(last_line(errlog.read(), f"ffmpeg a échoué (code {rc})"))
     os.replace(part, out)
+
+
+MIX_KEYS = ("aspect", "resolution", "fps", "crf", "preset", "compression", "audio_kbps", "fade")
+
+
+def clock(t: float, hours: bool) -> str:
+    t = int(t)
+    return f"{t // 3600}:{t // 60 % 60:02d}:{t % 60:02d}" if hours else f"{t // 60}:{t % 60:02d}"
+
+
+def mix_name(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", str(name or "")).strip(" .")[:80]
+    return name or "Compilation"
+
+
+def convert_mix(items: list[tuple[Path, dict]], s0: dict, out: Path, on_progress=None, set_proc=None) -> None:
+    """Plusieurs morceaux enchaînés dans une seule vidéo. Chacun garde son titre, sa jaquette et
+    ses réglages ; le format, la résolution et la qualité viennent des réglages communs (s0)."""
+    ensure_tools()
+    if not TOOLS["ffmpeg"]:
+        raise RuntimeError("FFmpeg introuvable")
+    if not TOOLS["x264"]:
+        raise RuntimeError("Ce ffmpeg n'inclut pas l'encodeur libx264")
+    if on_progress:
+        on_progress(0, "préparation…")
+    fps = s0["fps"]
+    W, H = frame_size(s0)
+    durs = []
+    for mp3, _ in items:
+        d = probe(mp3)["duration"]
+        if not d:
+            raise RuntimeError(f"Durée illisible : {mp3.name}")
+        durs.append(d)
+    total = sum(durs)
+    workers = parallel_workers(s0, W, H)
+    want = max(workers, math.ceil(total / SEGMENT_TARGET))
+    parts, chapters, T = [], [], 0.0
+    for i, ((mp3, st), d) in enumerate(zip(items, durs)):
+        si = dict(st, **{k: s0[k] for k in MIX_KEYS})
+        f0, f1 = round(T * fps), round((T + d) * fps)       # images de ce morceau dans la vidéo
+        tp = track_parts(mp3, si, d, f1 - f0, max(1, round(want * d / total)))
+        if i > 0:
+            tp[0]["tin"] = True                             # court fondu entre deux morceaux
+        if i < len(items) - 1:
+            tp[-1]["tout"] = True
+        parts += tp
+        chapters.append((f0 / fps, f1 / fps, title_text(mp3, si)))
+        T += d
+    # son : les morceaux bout à bout (même fréquence, stéréo)
+    audio, chain = [], ""
+    for i, (mp3, _) in enumerate(items):
+        audio += ["-i", str(mp3)]
+        chain += f"[{i}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}];"
+    chain += "".join(f"[a{i}]" for i in range(len(items))) + f"concat=n={len(items)}:v=0:a=1[a]"
+    audio += ["-filter_complex", chain, "-map", "[a]", "-c:a", "aac", "-b:a", f"{s0['audio_kbps']}k"]
+    esc = lambda t: re.sub(r"([=;#\\\n])", r"\\\1", t)
+    meta = TMP / f"chapitres_{secrets.token_hex(4)}.txt"
+    meta.write_text(";FFMETADATA1\n" + "".join(
+        f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={round(a * 1000)}\nEND={round(b * 1000)}\ntitle={esc(t)}\n"
+        for a, b, t in chapters), encoding="utf-8")
+    try:
+        render_parts(parts, audio, out, total, workers, on_progress, set_proc, chapters=meta)
+    finally:
+        meta.unlink(missing_ok=True)
+    hours = total >= 3600                                   # chapitres à coller dans la description YouTube
+    out.with_suffix(".txt").write_text(
+        "".join(f"{clock(a, hours)} {t}\n" for a, _, t in chapters), encoding="utf-8")
 
 
 def render_preview(mp3: Path, s: dict) -> tuple[float, float, str]:
@@ -1698,14 +1790,19 @@ class Queue:
         with self.lock:
             return [dict(j) for j in self.jobs]
 
-    def start(self, names: list[str], per: dict, force: bool) -> str | None:
+    def start(self, names: list[str], per: dict, force: bool, mix: dict | None = None) -> str | None:
         with self.lock:
             if self.running:
                 return "Une conversion est déjà en cours"
-            self.jobs = [{"name": n, "status": "wait", "progress": 0, "speed": "", "error": ""}
-                         for n in names]
+            if mix:                                # une seule vidéo pour tous les morceaux
+                self.jobs = [{"name": mix["out"], "status": "wait", "progress": 0, "speed": "", "error": "",
+                              "mix": len(names)}]
+            else:
+                self.jobs = [{"name": n, "status": "wait", "progress": 0, "speed": "", "error": ""}
+                             for n in names]
             self.running, self.cancelled = True, False
-        threading.Thread(target=self._work, args=(per, force), daemon=True).start()
+        target, args = (self._work_mix, (names, per, mix)) if mix else (self._work, (per, force))
+        threading.Thread(target=target, args=args, daemon=True).start()
         return None
 
     def cancel(self) -> None:
@@ -1718,6 +1815,22 @@ class Queue:
     def _set_proc(self, p) -> None:
         with self.lock:
             self.proc = p
+
+    def _work_mix(self, names: list[str], per: dict, mix: dict) -> None:
+        job = self.jobs[0]
+        job["status"] = "run"
+        try:
+            items = [(INPUT_DIR / n, per[n]) for n in names]
+            missing = [p.name for p, _ in items if not p.is_file()]
+            if missing:
+                raise RuntimeError("Fichier introuvable : " + ", ".join(missing))
+            convert_mix(items, mix["s0"], OUTPUT_DIR / mix["out"],
+                        on_progress=lambda p, sp: job.update(progress=p, speed=sp), set_proc=self._set_proc)
+            job.update(status="ok", progress=100)
+        except Exception as e:  # noqa: BLE001
+            job.update(status="cancel" if self.cancelled else "err", error=str(e)[:300])
+        with self.lock:
+            self.running = False
 
     def _work(self, per: dict, force: bool) -> None:
         for job in self.jobs:
@@ -1954,7 +2067,16 @@ class Handler(BaseHTTPRequestHandler):
             if not names:
                 return self._json({"ok": False, "error": "Aucun morceau sélectionné"})
             per = {n: dict(settings_for(n)) for n in names}   # réglages de chaque morceau
-            err = QUEUE.start(names, per, bool(data.get("force")))
+            mix = None
+            if data.get("combine"):                # une seule vidéo, dans l'ordre envoyé
+                if len(names) < 2:
+                    return self._json({"ok": False, "error": "Coche au moins 2 morceaux pour en faire une seule vidéo"})
+                base_name = mix_name(data.get("name"))
+                out_name, k = base_name + ".mp4", 2
+                while (OUTPUT_DIR / out_name).exists() and not data.get("force"):
+                    out_name, k = f"{base_name} ({k}).mp4", k + 1
+                mix = {"out": out_name, "s0": dict(SETTINGS)}
+            err = QUEUE.start(names, per, bool(data.get("force")), mix)
             self._json({"ok": err is None, "error": err})
         elif url.path == "/api/cancel":
             QUEUE.cancel()
@@ -2393,7 +2515,12 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .job.ok .bar i{background:var(--ok)}
 .job-err{font-size:12px;color:var(--err);margin-top:4px;word-break:break-word}
 .action{position:fixed;left:0;right:0;bottom:0;z-index:10;display:flex;align-items:center;gap:16px;padding:12px 22px;background:color-mix(in srgb,var(--panel) 92%,transparent);backdrop-filter:blur(12px);border-top:1px solid var(--line)}
-.action .sum{color:var(--muted);font-size:13px}
+.action .sum{color:var(--muted);font-size:13px;white-space:nowrap}
+.action .opts{display:flex;flex-wrap:wrap;align-items:center;gap:6px 18px;min-width:0}
+#mixName{padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--text);font:inherit;font-size:13px;width:200px;max-width:100%}
+.ord{display:flex;flex-direction:column;gap:1px}.ord button{border:0;background:none;color:var(--muted);cursor:pointer;font-size:10px;line-height:1;padding:1px 4px;border-radius:4px}
+.ord button:hover{color:var(--accent);background:var(--sel)}.ord button:disabled{opacity:.25;cursor:default;background:none}
+.tag.pos{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,transparent);font-weight:650}
 @media (max-width:640px){.action{flex-wrap:wrap;gap:8px 12px;padding:10px 16px}.action .sum,.action .grow{display:none}.action .btn.primary{width:100%}header .sub{display:none}main{padding:14px 14px 150px}}
 .warnbox{background:color-mix(in srgb,var(--warn) 12%,var(--panel));border:1px solid color-mix(in srgb,var(--warn) 40%,transparent);border-radius:11px;padding:12px 14px;font-size:13px}
 .warnbox code{font-size:12px;background:var(--panel2);padding:1px 5px;border-radius:5px;word-break:break-all}
@@ -2580,7 +2707,11 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 </main>
 
 <div class="action">
-  <label class="check"><input type="checkbox" id="force"><span>Refaire les vidéos déjà converties</span></label>
+  <div class="opts">
+    <label class="check"><input type="checkbox" id="force"><span>Refaire les vidéos déjà converties</span></label>
+    <label class="check" title="Les morceaux cochés s'enchaînent dans une seule vidéo, chacun avec son titre et sa jaquette"><input type="checkbox" id="mix"><span>Une seule vidéo avec les morceaux cochés</span></label>
+    <input type="text" id="mixName" maxlength="80" placeholder="Nom de la vidéo" value="Compilation" title="Nom de la vidéo" hidden>
+  </div>
   <div class="grow"></div>
   <span class="sum" id="sum"></span>
   <button class="btn primary" id="go">Convertir</button>
@@ -2624,6 +2755,10 @@ const STYLES = {
 const MASK = ["circle","retro","mirror","cubes","aurora"], ROUND = ["circle","tunnel"], CQT = ["circle","retro","mirror","cubes"];
 let S = null, settings = null, checked = new Set(), seen = new Set(), selected = null, saveT = null, lastImgs = "", cvName = null;
 let globalSet = null, tracks = {}, pendingSave = null;   // réglages communs / propres à certains morceaux
+let order = [], mixOn = false;                           // une seule vidéo : ordre des morceaux
+try { const m = JSON.parse(localStorage.getItem("o2v_mix") || "{}"); order = m.order || []; mixOn = !!m.on;
+      window._mixName = m.name || ""; } catch(e){}
+function saveMix(){ try { localStorage.setItem("o2v_mix", JSON.stringify({on: mixOn, order, name: $("#mixName").value})); } catch(e){} }
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
@@ -2790,7 +2925,12 @@ function renderFiles(){
   if (!S.files.length){
     box.appendChild(el("div","empty","Aucun morceau pour l'instant. Glisse-les ci-dessus, ou dépose-les dans le dossier input."));
   }
-  for (const f of S.files){
+  const byName = new Map(S.files.map(f => [f.name, f]));
+  order = order.filter(n => byName.has(n));
+  S.files.forEach(f => { if (!order.includes(f.name)) order.push(f.name); });
+  const picked = order.filter(n => checked.has(n));
+  for (const [idx, fname] of order.entries()){
+    const f = byName.get(fname);
     if (!seen.has(f.name)){ seen.add(f.name); if (!f.done) checked.add(f.name); }
     if (!selected) selected = f.name;
     const row = el("div","file" + (selected === f.name ? " sel" : ""));
@@ -2813,6 +2953,14 @@ function renderFiles(){
       const pl = el("button","btn small","▶"); pl.title = "Ouvrir la vidéo";
       pl.onclick = e => { e.stopPropagation(); post("/api/open",{what:"video",name:f.name}); };
       meta.appendChild(pl);
+    }
+    if (mixOn){                                  // une seule vidéo : position et flèches pour l'ordre
+      const pos = picked.indexOf(f.name);
+      if (pos >= 0) meta.prepend(el("span","tag pos", String(pos + 1)));
+      const ord = el("div","ord"), up = el("button",null,"▲"), dn = el("button",null,"▼");
+      up.title = "Monter"; dn.title = "Descendre"; up.disabled = idx === 0; dn.disabled = idx === order.length - 1;
+      const mv = d => e => { e.stopPropagation(); const j = idx + d; [order[idx], order[j]] = [order[j], order[idx]]; saveMix(); renderFiles(); };
+      up.onclick = mv(-1); dn.onclick = mv(1); ord.append(up, dn); meta.appendChild(ord);
     }
     row.append(cb, th, name, meta);
     row.onclick = async () => {
@@ -2838,9 +2986,15 @@ function renderFiles(){
 function updateAction(){
   const n = S ? S.files.filter(f => checked.has(f.name)).length : 0;
   const go = $("#go");
+  const tot = S ? S.files.filter(f => checked.has(f.name)).reduce((a,f) => a + (f.duration||0), 0) : 0;
+  if (mixOn){
+    go.textContent = S && S.running ? "Conversion en cours…" : (n >= 2 ? `Créer 1 vidéo (${n} morceaux)` : "Coche au moins 2 morceaux");
+    go.disabled = !S || S.running || n < 2 || !S.ffmpeg;
+    $("#sum").textContent = n ? `${n} morceau${n>1?"x":""} · ${fmt(tot)} → 1 vidéo` : "";
+    return;
+  }
   go.textContent = S && S.running ? "Conversion en cours…" : (n ? `Convertir ${n} morceau${n>1?"x":""}` : "Convertir");
   go.disabled = !S || S.running || !n || !S.ffmpeg;
-  const tot = S ? S.files.filter(f => checked.has(f.name)).reduce((a,f) => a + (f.duration||0), 0) : 0;
   $("#sum").textContent = n ? `${n} sélectionné${n>1?"s":""} · ${fmt(tot)} de musique` : "";
 }
 
@@ -2877,7 +3031,7 @@ function renderJobs(){
   for (const j of S.jobs){
     const d = el("div","job " + j.status);
     const top = el("div","job-top");
-    top.appendChild(el("div","fname",j.name));
+    top.appendChild(el("div","fname", j.mix ? `${j.name} · ${j.mix} morceaux` : j.name));
     let label = ST[j.status] || j.status;
     if (j.status === "run") label += ` · ${Math.floor(j.progress)} %` + (j.speed && j.speed !== "N/A" ? ` · ${j.speed}` : "");
     top.appendChild(el("span","job-st " + (j.status === "ok" ? "ok" : j.status === "err" ? "err" : ""), label));
@@ -2965,6 +3119,9 @@ function renderStatus(){
 
 /* ── démarrage ── */
 buildStyles(); bindInputs(); bindPicker();
+$("#mix").checked = mixOn; $("#mixName").hidden = !mixOn; if (window._mixName) $("#mixName").value = window._mixName;
+$("#mix").onchange = e => { mixOn = e.target.checked; $("#mixName").hidden = !mixOn; saveMix(); renderFiles(); };
+$("#mixName").oninput = saveMix;
 $("#all").onclick = () => { S.files.forEach(f => checked.add(f.name)); renderFiles(); };
 $("#none").onclick = () => { checked.clear(); renderFiles(); };
 $("#openIn").onclick = () => post("/api/open",{what:"input"});
@@ -2994,9 +3151,10 @@ $("#same").onchange = async e => {
 $("#myCv").onclick = $("#myCvBtn").onclick = () => { if (selected) openCover(selected); };
 $("#cancel").onclick = () => post("/api/cancel").then(() => refresh(true));
 $("#go").onclick = async () => {
-  const files = S.files.filter(f => checked.has(f.name)).map(f => f.name);
+  const files = order.filter(n => checked.has(n));        // dans l'ordre choisi
   await flushSave();
-  const r = await post("/api/convert",{files, settings: globalSet, force: $("#force").checked});
+  const r = await post("/api/convert",{files, settings: globalSet, force: $("#force").checked,
+                                      combine: mixOn, name: $("#mixName").value});
   if (!r.ok) alert(r.error || "Erreur"); refresh(true);
 };
 $("#quit").onclick = async () => {
