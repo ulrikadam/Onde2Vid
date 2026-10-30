@@ -1735,43 +1735,106 @@ def _inputs(g: Graph) -> list[str]:
 _HW: dict = {}
 _HW_LOCK = threading.Lock()
 
+# Encodeurs H.264 des puces graphiques, essayés dans cet ordre : le premier qui marche est gardé.
+HW_CANDIDATES = {
+    "darwin": ["h264_videotoolbox"],                       # Mac (Apple Silicon et Intel)
+    "win32": ["h264_nvenc", "h264_amf", "h264_qsv"],       # NVIDIA, AMD, Intel
+    "linux": ["h264_nvenc", "h264_vaapi", "h264_qsv"],     # NVIDIA, AMD/Intel (VA-API), Intel
+}
+HW_NAMES = {"h264_videotoolbox": "Apple", "h264_nvenc": "NVIDIA", "h264_amf": "AMD",
+            "h264_qsv": "Intel", "h264_vaapi": "VA-API"}
+HW_QP_OFFSET = 4          # QP = CRF + 4 : même qualité que libx264 (mesuré au VMAF), fichiers ~30 % plus gros
+HW_PARALLEL = {"h264_videotoolbox": 2}   # parties calculées en même temps avec la puce (autres : 3)
+# Images à passer dans la mémoire de la puce (VA-API), ou à mettre dans son format (Quick Sync)
+HW_UPLOAD = {"h264_vaapi": "format=nv12,hwupload", "h264_qsv": "format=nv12"}
+VAAPI_DEVICE = "/dev/dri/renderD128"
 
-def hw_encoder() -> str | None:
-    """Encodeur H.264 de la puce graphique s'il fonctionne vraiment (ONDE2VID_HWENC=0 pour l'ignorer)."""
-    if os.environ.get("ONDE2VID_HWENC", "").strip() == "0":
-        return None
+
+def hw_candidates() -> list[str]:
+    """ONDE2VID_HWENC=0 : jamais la puce graphique ; ONDE2VID_HWENC=h264_qsv (par ex.) : celui-là seulement."""
+    forced = os.environ.get("ONDE2VID_HWENC", "").strip()
+    if forced == "0":
+        return []
+    if forced in HW_NAMES:
+        return [forced]
+    return HW_CANDIDATES.get(sys.platform, [])
+
+
+def hw_args(enc: str, s: dict, W: int, H: int) -> list[str]:
+    """Réglages d'un encodeur de puce graphique.
+    NVIDIA, AMD, Intel : qualité constante (QP), comme le CRF du processeur, le débit suit la
+    richesse de l'image (un spectrogramme demande deux fois plus qu'un cercle).
+    Mac : débit fixe adapté à la taille de l'image (≈ 1,5 Mb/s en 1080p à 30 i/s pour la
+    qualité Haute ; chaque cran de qualité → ×1,25), les Mac Intel n'ayant pas de qualité constante."""
+    q = str(s["crf"] + HW_QP_OFFSET)
+    if enc == "h264_videotoolbox":
+        kbps = int(W * H * s["fps"] * 0.025 / 1000 * (1.25 ** ((20 - s["crf"]) / 2)))
+        opts = ["-b:v", f"{kbps}k", "-prio_speed", "1"]
+    elif enc == "h264_nvenc":
+        opts = ["-preset", "p4", "-rc", "constqp", "-qp", q]
+    elif enc == "h264_amf":
+        opts = ["-usage", "transcoding", "-quality", "balanced", "-rc", "cqp",
+                "-qp_i", q, "-qp_p", q, "-qp_b", q]
+    elif enc == "h264_qsv":
+        opts = ["-preset", "medium", "-q:v", q]
+    elif enc == "h264_vaapi":
+        opts = ["-vaapi_device", VAAPI_DEVICE, "-rc_mode", "CQP", "-qp", q]
+    else:
+        opts = []
+    return ["-c:v", enc, *opts, "-profile:v", "high"]
+
+
+def _hw_works(ff: str, enc: str, W: int, H: int) -> bool:
+    """Courte compression d'essai, avec exactement les réglages utilisés ensuite."""
+    cmd = [ff, "-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi",
+           "-i", f"color=s={W}x{H}:r=30:d=0.3", "-vf", HW_UPLOAD.get(enc, "format=yuv420p"),
+           *hw_args(enc, DEFAULTS, W, H), "-f", "null", "-"]
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL, timeout=30, **NO_WINDOW).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def hw_encoder(W: int = 640, H: int = 360) -> str | None:
+    """Encodeur H.264 de la puce graphique s'il fonctionne vraiment pour des images W×H
+    (certaines puces refusent la 4K, surtout en vertical). Testé une fois par taille."""
+    cands = hw_candidates()
     ff = TOOLS["ffmpeg"]
-    if not ff:
+    if not ff or not cands:
         return None
     with _HW_LOCK:                         # un seul test, même si plusieurs requêtes arrivent
-        if "enc" in _HW:
-            return _HW["enc"]
-        enc_found = None
-        cands = ["h264_videotoolbox"] if sys.platform == "darwin" else []
-        try:
-            listed = run_text([ff, "-hide_banner", "-encoders"]).stdout
-            for enc in cands:
-                if enc in listed and run_text(
-                        [ff, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                         "color=s=640x360:r=30:d=0.5", "-c:v", enc, "-b:v", "1M", "-f", "null", "-"]
-                        ).returncode == 0:
-                    enc_found = enc
-                    break
-        except (OSError, subprocess.SubprocessError):
-            pass
-        _HW["enc"] = enc_found
-        return enc_found
+        key = (W, H)
+        if key not in _HW:
+            try:
+                listed = run_text([ff, "-hide_banner", "-encoders"]).stdout
+            except (OSError, subprocess.SubprocessError):
+                listed = ""
+            _HW[key] = next((e for e in cands if e in listed and _hw_works(ff, e, W, H)), None)
+            print(f"Puce graphique ({W}x{H}) : {_HW[key] or 'aucune, compression par le processeur'}",
+                  flush=True)
+        return _HW[key]
+
+
+def use_hw(s: dict, W: int, H: int) -> str | None:
+    """Encodeur de puce graphique à utiliser pour cette conversion (None : processeur)."""
+    return hw_encoder(W, H) if s["compression"] == "fast" else None
 
 
 def video_args(s: dict, W: int, H: int) -> list[str]:
     """Réglages de compression vidéo : puce graphique (mode Rapide) si possible, sinon libx264."""
-    enc = hw_encoder() if s["compression"] == "fast" else None
-    if enc == "h264_videotoolbox":
-        # débit adapté à la taille de l'image (≈ 1,5 Mb/s en 1080p à 30 i/s), CRF 18 → +25 %
-        kbps = int(W * H * s["fps"] * 0.025 / 1000 * (1.25 ** ((20 - s["crf"]) / 2)))
-        return ["-c:v", enc, "-b:v", f"{kbps}k", "-prio_speed", "1", "-profile:v", "high",
-                "-r", str(s["fps"])]
+    enc = use_hw(s, W, H)
+    if enc:
+        return [*hw_args(enc, s, W, H), "-r", str(s["fps"])]
     return ["-c:v", "libx264", "-preset", s["preset"], "-crf", str(s["crf"]), "-r", str(s["fps"])]
+
+
+def graph_args(g: Graph, s: dict, W: int, H: int) -> list[str]:
+    """Graphe de filtres et sortie vidéo ; certaines puces veulent les images dans leur mémoire."""
+    up = HW_UPLOAD.get(use_hw(s, W, H) or "")
+    if up:
+        return ["-filter_complex", f"{g.text()};[v]{up}[vh]", "-map", "[vh]"]
+    return ["-filter_complex", g.text(), "-map", "[v]"]
 
 
 TRANS_D = 0.4             # durée du fondu quand le visualiseur change (secondes)
@@ -1819,8 +1882,9 @@ def parallel_workers(s: dict, W: int, H: int) -> int:
     if forced.isdigit():
         return max(1, int(forced))
     n = max(1, (os.cpu_count() or 2) // 2)
-    if s["compression"] == "fast" and hw_encoder():   # la puce graphique devient la limite : 2 parties suffisent
-        n = min(n, 2)
+    enc = use_hw(s, W, H)
+    if enc:     # le processeur ne fait plus que dessiner : au-delà, plus rien à gagner (mesuré)
+        n = min(n, HW_PARALLEL.get(enc, 3))
     if W * H > 4_000_000:                  # 4K : chaque partie demande beaucoup de mémoire
         n = min(n, 3)
     return min(n, 8)
@@ -1939,7 +2003,7 @@ def render_parts(parts: list[dict], audio_args: list[str], out: Path, total: flo
         if start - pre > 0:
             cmd += ["-ss", f"{start - pre:.6f}"]
         cmd += ["-t", f"{length + pre + 1:.6f}", "-i", str(mp3), *_inputs(g),
-                "-filter_complex", g.text(), "-map", "[v]", "-an",
+                *graph_args(g, sp, W, H), "-an",
                 *video_args(sp, W, H), "-threads", threads,
                 "-frames:v", str(b - a), str(work / f"partie{k:03d}.mp4")]
         _run_ff(cmd, group, lambda sec: progress(k, min(length, sec)))
@@ -1987,7 +2051,63 @@ def convert_parallel(mp3: Path, s: dict, out: Path, dur: float, workers: int,
     render_parts(parts, audio, out, dur, workers, on_progress, set_proc)
 
 
+class _Run:
+    """Processus en cours d'une conversion (pour le bouton Annuler). Retient l'annulation,
+    pour ne jamais relancer une conversion que l'utilisateur a arrêtée."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.cancelled = False
+
+    def __call__(self, p) -> None:              # sert de set_proc
+        with self.lock:
+            self.proc = p
+            stop = p is not None and self.cancelled
+        if stop:
+            self._stop(p)
+
+    def terminate(self) -> None:
+        with self.lock:
+            self.cancelled = True
+            p = self.proc
+        if p:
+            self._stop(p)
+
+    @staticmethod
+    def _stop(p) -> None:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+
+
+def with_cpu_fallback(work, s: dict, on_progress=None, set_proc=None) -> None:
+    """Lance work(réglages, set_proc). Si la puce graphique échoue en route (pilote trop ancien,
+    puce déjà occupée…), la conversion recommence avec le processeur, sauf si elle a été annulée."""
+    run = _Run()
+    if set_proc:
+        set_proc(run)
+    try:
+        try:
+            work(s, run)
+        except RuntimeError as e:
+            if run.cancelled or not use_hw(s, *frame_size(s)):
+                raise
+            print(f"Échec avec la puce graphique ({e}) : nouvel essai avec le processeur", flush=True)
+            if on_progress:
+                on_progress(0, "nouvel essai (processeur)…")
+            work(dict(s, compression="compact"), run)
+    finally:
+        if set_proc:
+            set_proc(None)
+
+
 def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) -> None:
+    with_cpu_fallback(lambda s1, sp: _convert_one(mp3, s1, out, on_progress, sp), s, on_progress, set_proc)
+
+
+def _convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) -> None:
     ensure_tools()
     ff = TOOLS["ffmpeg"]
     if not ff:
@@ -2009,8 +2129,7 @@ def convert_one(mp3: Path, s: dict, out: Path, on_progress=None, set_proc=None) 
     cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
            "-progress", "pipe:1", "-nostats",
            "-i", str(mp3), *_inputs(g),
-           "-filter_complex", g.text(),
-           "-map", "[v]", "-map", "0:a",
+           *graph_args(g, s, W, H), "-map", "0:a",
            *video_args(s, W, H), "-c:a", "aac", "-b:a", f"{s['audio_kbps']}k"]
     if dur:
         cmd += ["-t", f"{dur + 1:.3f}"]
@@ -2055,6 +2174,10 @@ def mix_name(name: str) -> str:
 def convert_mix(items: list[tuple[Path, dict]], s0: dict, out: Path, on_progress=None, set_proc=None) -> None:
     """Plusieurs morceaux enchaînés dans une seule vidéo. Chacun garde son titre, sa jaquette et
     ses réglages ; le format, la résolution et la qualité viennent des réglages communs (s0)."""
+    with_cpu_fallback(lambda s1, sp: _convert_mix(items, s1, out, on_progress, sp), s0, on_progress, set_proc)
+
+
+def _convert_mix(items: list[tuple[Path, dict]], s0: dict, out: Path, on_progress=None, set_proc=None) -> None:
     ensure_tools()
     if not TOOLS["ffmpeg"]:
         raise RuntimeError("FFmpeg introuvable")
@@ -2246,7 +2369,8 @@ def app_state() -> dict:
                       "tag": f"{info['artist']} – {info['title']}".strip(" –") if info["title"] else "",
                       "done": (OUTPUT_DIR / (f.stem + ".mp4")).exists()})
     return {"files": files, "images": list_images(), "jobs": QUEUE.snapshot(),
-            "running": QUEUE.running, "ffmpeg": TOOLS["ffmpeg"], "x264": TOOLS["x264"], "hw": bool(hw_encoder()),
+            "running": QUEUE.running, "ffmpeg": TOOLS["ffmpeg"], "x264": TOOLS["x264"],
+            "hw": HW_NAMES.get(hw_encoder() or "", ""),
             "title_ok": title_ok(), "settings": SETTINGS, "tracks": TRACK_SETTINGS,
             "input": str(INPUT_DIR), "output": str(OUTPUT_DIR)}
 
@@ -2733,6 +2857,7 @@ def run_batch(force: bool) -> None:
     files = list_mp3()
     if not files:
         sys.exit(f"Aucun fichier audio dans {INPUT_DIR}")
+    use_hw(s, *frame_size(s))            # puce graphique testée (et annoncée) avant les progressions
     ok = 0
     for i, mp3 in enumerate(files, 1):
         out = OUTPUT_DIR / (mp3.stem + ".mp4")
@@ -3479,7 +3604,7 @@ function renderStatus(){
     w.style.display = "";
     $("#warnBox").textContent = "Ce ffmpeg ne contient pas l'encodeur H.264 (libx264). Télécharge une autre version de ffmpeg.";
   } else w.style.display = "none";
-  $("#hwOpt").textContent = S.hw ? "Rapide (puce graphique, fichiers plus gros)"
+  $("#hwOpt").textContent = S.hw ? `Rapide (puce graphique ${S.hw}, fichiers plus gros)`
                                  : "Rapide (puce graphique indisponible ici : processeur)";
   $("#titleSel").disabled = !S.title_ok;
   $("#titleWarn").hidden = !!S.title_ok;
@@ -3567,6 +3692,11 @@ refresh();
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):   # Windows : ✓ ✗ ➜ hors de l'encodage cp1252 → « ? » au lieu d'un plantage
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     p = argparse.ArgumentParser(description=f"{APP_NAME} : musique (MP3, WAV, FLAC…) → vidéo MP4 animée (interface ou mode batch).")
     p.add_argument("--batch", action="store_true", help="Convertir input/ sans interface")
     p.add_argument("--force", action="store_true", help="(batch) Refaire les vidéos existantes")
