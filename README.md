@@ -26,7 +26,7 @@ Avec Onde2Vid, vous pouvez :
 - réunir plusieurs morceaux dans **une seule vidéo**, dans l’ordre de votre choix : chaque titre s’affiche au bon moment et les chapitres YouTube sont prêts à copier ;
 - donner à chaque morceau ses propres réglages (visualiseur, jaquette, titre…), ou garder les mêmes pour toute la playlist ;
 - faire alterner plusieurs visualiseurs pendant un long morceau (toutes les 1 à 30 minutes) ;
-- convertir plus vite : les longs morceaux sont calculés en plusieurs parties en même temps, et la compression peut passer par la puce graphique sur Mac (réglage « Rapide ») ;
+- convertir plus vite : les longs morceaux sont calculés en plusieurs parties en même temps, et la compression peut passer par la puce graphique — Apple, NVIDIA, AMD ou Intel — sur Mac, Windows et Linux (réglage « Rapide ») ;
 - convertir tout le dossier en mode batch, sans interface.
 
 ## Version autonome (sans Python)
@@ -56,7 +56,7 @@ Les versions Mac sont signées et notarisées par Apple (plus aucun blocage à l
 Pour utiliser directement le script Python (au lieu de la version autonome) :
 
 - Python 3.9 ou une version plus récente
-- [FFmpeg](https://ffmpeg.org/), avec l’encodeur vidéo `libx264` (sur Mac, l’encodeur `h264_videotoolbox` de la puce graphique est utilisé s’il est disponible)
+- [FFmpeg](https://ffmpeg.org/), avec l’encodeur vidéo `libx264` (les encodeurs des puces graphiques sont utilisés s’ils sont disponibles : voir [Compression par la puce graphique](#compression-par-la-puce-graphique))
 
 Aucune bibliothèque Python supplémentaire n’est requise.
 
@@ -117,6 +117,22 @@ Pour les longs morceaux, cochez **« Changer de visualiseur pendant le morceau �
 3. Réglez l’ordre avec les flèches ▲▼, puis cliquez sur **Créer 1 vidéo**.
 
 Le son s’enchaîne sans coupure. Chaque passage garde son titre, sa jaquette et son visualiseur ; le format, la résolution et la qualité sont les mêmes pour toute la vidéo. Les chapitres sont intégrés au MP4, et un fichier texte du même nom est créé à côté (par exemple `0:00 Titre 1`, `5:02 Titre 2`…) : collez-le dans la description YouTube pour obtenir les chapitres (YouTube en demande au moins trois de 10 secondes ou plus).
+
+### Compression par la puce graphique
+
+Avec le réglage **Compression → Rapide** (par défaut), la compression vidéo est confiée à la puce graphique quand elle en est capable : le processeur reste libre pour dessiner le visualiseur, et la conversion va nettement plus vite.
+
+| Système | Puces graphiques prises en charge |
+| --- | --- |
+| macOS | Apple Silicon et Mac Intel (VideoToolbox) |
+| Windows | NVIDIA (NVENC), AMD (AMF), Intel (Quick Sync) |
+| Linux | NVIDIA (NVENC), AMD et Intel (VA-API), Intel (Quick Sync) |
+
+Au démarrage, Onde2Vid fait un court essai de compression et garde la première puce qui fonctionne ; le menu affiche alors son nom, par exemple « Rapide (puce graphique AMD…) ». Si aucune ne fonctionne, ou si la puce échoue en cours de route, la conversion passe automatiquement par le processeur. Avec une carte NVIDIA, un pilote récent est nécessaire.
+
+Sur Windows et Linux, la qualité d’image est la même qu’en mode Compacte, avec des fichiers environ 30 % plus gros. Pour le fichier le plus léger possible, choisissez **Compacte (processeur)**.
+
+Pour les tests, la variable d’environnement `ONDE2VID_HWENC=0` désactive la puce graphique, et `ONDE2VID_HWENC=h264_nvenc` (ou `h264_amf`, `h264_qsv`, `h264_vaapi`, `h264_videotoolbox`) n’essaie que celle-là.
 
 ## Organisation des fichiers
 
