@@ -17,7 +17,7 @@ Tout le traitement est réalisé sur votre ordinateur. Aucun compte, abonnement 
 Avec Onde2Vid, vous pouvez :
 
 - convertir un ou plusieurs morceaux en MP4 : MP3, WAV, FLAC, M4A/AAC, OGG, Opus, AIFF, WMA… ;
-- choisir parmi plusieurs visualiseurs : cercle, égaliseur, onde, spectrogramme, tunnel, aurore, etc. ;
+- choisir parmi plusieurs visualiseurs : mandala, horizon néon, hyperespace, cercle, égaliseur, onde, spectrogramme, tunnel, aurore, etc. ; certains (horizon néon, hyperespace) accélèrent sur les basses ;
 - utiliser la pochette intégrée au fichier audio, une jaquette personnalisée ou une image de fond ;
 - ajouter un titre, un sous-titre, une barre de progression et des effets de pulsation ;
 - exporter au format paysage (16:9), vertical (9:16) ou carré (1:1) ;
