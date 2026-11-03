@@ -98,7 +98,7 @@ AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".alac", ".ogg", ".oga", "
 STYLES = ["mandala", "synthwave", "warp", "circle", "retro", "mirror", "tunnel", "cubes", "aurora",
           "cqt", "bars", "waves", "spectrum", "scope"]
 MASK_STYLES = {"circle", "retro", "mirror", "cubes", "aurora",
-               "mandala", "synthwave", "warp"}                   # colorés avec un schéma
+               "mandala", "synthwave", "warp", "cqt", "scope"}                   # colorés avec un schéma
 ROUND_STYLES = {"circle", "tunnel", "mandala", "synthwave", "warp"}   # jaquette ronde
 BEAT_STYLES = {"synthwave", "warp"}                              # vitesse qui suit les basses
 PALETTES = ["intensity", "rainbow", "fire", "cool", "magma", "viridis", "plasma", "nebulae"]
@@ -126,7 +126,7 @@ DEFAULTS = {
     "palette": "intensity",   # palette du spectrogramme / tunnel
     "viz_size": 35,           # taille du visualiseur (% de l'image)
     "viz_pos": "bottom",      # top / center / bottom
-    "glow": True,             # lueur néon
+    "neon": 50,               # effet néon : lueur autour du visualiseur (0 = aucune)
     "sensitivity": 50,        # hauteur des barres
     "image": "__auto__",      # fond : __auto__ (jaquette) / __none__ / nom d'une image de input/
     "layout": "auto",         # jaquette au 1er plan : auto / cover (carrée) / round / fill (aucune)
@@ -328,9 +328,12 @@ def clean_settings(raw) -> dict:
     s["effect"] = _pick(s["effect"], ["none", "blur", "dark", "both"], "both")
     s["cover_default"] = Path(str(s["cover_default"])).name or "__none__"
     s["pulse"] = _clamp_int(s["pulse"], 0, 100, DEFAULTS["pulse"])
+    if isinstance(raw, dict) and "neon" not in raw and raw.get("glow") is False:
+        s["neon"] = 0                                   # anciens réglages : case « Effet néon » décochée
+    s["neon"] = _clamp_int(s["neon"], 0, 100, DEFAULTS["neon"])
     s["title_src"] = _pick(s["title_src"], ["auto", "file"], "auto")
     s["subtitle"] = re.sub(r"\s+", " ", str(s["subtitle"] or ""))[:80]
-    for k in ("glow", "pulse_bg", "title", "progress", "fade"):
+    for k in ("pulse_bg", "title", "progress", "fade"):
         s[k] = bool(s[k])
     s["aspect"] = _pick(s["aspect"], list(ASPECTS), "16:9")
     s["resolution"] = _pick(s["resolution"], list(QUALITY), "1080p")
@@ -710,6 +713,13 @@ def front_spec(L: dict, scale: float = 1.0):
         if front == "round":
             args = ["-i", cover, "-vf",
                     f"scale={D}:{D}:force_original_aspect_ratio=increase,crop={D}:{D},format=rgba,{geq}"]
+        elif L["style"] == "synthwave":          # soleil rétro : dégradé jaune → rose, rayé en bas
+            y1, P = D * 0.5, D / 9
+            gap = f"if(gt(Y,{y1:.1f}),lt(mod(Y-{y1:.1f},{P:.2f}),{P:.2f}*(0.86-0.5*(Y-{y1:.1f})/{D - y1:.1f})),1)"
+            args = ["-f", "lavfi", "-i",
+                    f"gradients=s={D}x{D}:c0=0xffe45c:c1=0xff7a3d:c2=0xff2d95:n=3:x0=0:y0=0:x1=0:y1={D}:speed=0:d=1",
+                    "-vf", f"format=rgba,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='255*clip({R}-{dist},0,1)*{gap}'"]
+            return D, D, args, ("sun", D, 2)
         else:
             args = ["-f", "lavfi", "-i", f"color=c=0x14141c:s={D}x{D}:d=1", "-vf", f"format=rgba,{geq}"]
         return D, D, args, ("round", front, file_key(cover), D, b)
@@ -1143,6 +1153,30 @@ def halo_image(w: int, h: int, cx: float, cy: float, rc: float, width: float, pe
     return cached_gray("halo", (round(cx, 1), round(cy, 1), round(rc, 1), round(width, 1), peak), w, h, build)
 
 
+def synth_backdrop(w: int, h: int, hz: int, cy: float, rc: float) -> Path:
+    """Transparence du fond sombre d'Horizon néon : ciel légèrement voilé jusqu'à l'horizon,
+    sol presque opaque (la grille ressort même sur une jaquette claire). Rien sur le soleil."""
+    def build():
+        buf = bytearray(w * h)
+        cx = w / 2
+        for v in range(h):
+            if v < hz:
+                f = (v + 0.5) / max(1, hz)
+                a = 0.62 * f * f * (3 - 2 * f)
+            else:
+                a = 0.9
+            row = bytearray([int(255 * a)]) * w
+            dy = v + 0.5 - cy
+            if abs(dy) < rc + 1:
+                half = math.sqrt(max(0.0, (rc + 1) ** 2 - dy * dy))
+                for u in range(max(0, int(cx - half)), min(w, int(cx + half) + 1)):
+                    d = math.hypot(u + 0.5 - cx, dy)
+                    row[u] = int(row[u] * min(1.0, max(0.0, d - rc + 1)))
+            buf[v * w:(v + 1) * w] = row
+        return bytes(buf)
+    return cached_gray("ciel", (hz, round(cy, 1), round(rc, 1)), w, h, build)
+
+
 def _lines(x: float, f: float, w: float) -> float:
     """Part d'un pixel (largeur f, en périodes) couverte par des lignes d'épaisseur w (anticrénelage)."""
     def acc(t):
@@ -1154,9 +1188,9 @@ def _lines(x: float, f: float, w: float) -> float:
 def synth_floor(W: int, nrows: int, K: int, cell: float, cols: int):
     """Sol quadrillé en perspective : lignes de fuite fixes et lignes horizontales qui défilent
     (une colonne par position du défilement). Lointain estompé, lueur sur l'horizon."""
-    wh, wv = 0.08, 0.035
+    wh, wv, fz = 0.11, 0.05, 10.0
     zs = [nrows / (j + 0.5) for j in range(nrows)]
-    fog = [math.exp(-z / 6.5) for z in zs]
+    fog = [math.exp(-z / fz) for z in zs]
 
     def strip():
         buf = bytearray(K * nrows)
@@ -1181,8 +1215,126 @@ def synth_floor(W: int, nrows: int, K: int, cell: float, cols: int):
                 val = max(fog[j] * _lines(X * k + wv / 2, fpx + abs(X) * dz, wv), haze)
                 buf[row + u] = 255 if j < 2 else int(255 * val)
         return bytes(buf)
-    return (cached_gray("sol_h", (K, cell, wh), K, nrows, strip),
-            cached_gray("sol_v", (cols, wv, 2), W, nrows, verticals))
+    return (cached_gray("sol_h", (K, cell, wh, fz), K, nrows, strip),
+            cached_gray("sol_v", (cols, wv, fz, 3), W, nrows, verticals))
+
+
+def _ridge(d: float) -> float:
+    """Profil des montagnes (0 au centre → 1 sur les bords), dentelé."""
+    return (0.42 + 0.58 * d ** 1.2) * (0.78 + 0.12 * math.sin(d * 23.0 + 1.3) * math.cos(d * 7.1)
+                                       + 0.07 * math.sin(d * 61.0 + 0.7) + 0.03 * math.sin(d * 149.0))
+
+
+def ridge_base(W: int, MH: int, k: float = 0.3) -> Path:
+    """Chaîne de montagnes toujours visible (la musique la fait grandir)."""
+    def build():
+        buf = bytearray(W * MH)
+        half = W / 2
+        prof = [k * _ridge(abs(u + 0.5 - half) / half) for u in range(W)]
+        for v in range(MH):
+            f = (MH - v - 0.5) / MH
+            row = v * W
+            for u in range(W):
+                if f < prof[u]:
+                    buf[row + u] = 255
+        return bytes(buf)
+    return cached_gray("ridge_base", (k,), W, MH, build)
+
+
+PIANO_FREQS = (27.5 * 2 ** (-1 / 24), 4186.01 * 2 ** (1 / 24))   # 88 touches : La 0 → Do 8
+
+
+def piano_keys(W: int):
+    """Les 88 touches (noire ?, gauche, droite) et leur largeur de touche blanche."""
+    mx = W * 0.025
+    wk = (W - 2 * mx) / 52
+    keys, wi = [], 0
+    for n in range(21, 109):
+        if n % 12 in (1, 3, 6, 8, 10):
+            c = mx + wi * wk
+            keys.append((True, c - 0.29 * wk, c + 0.29 * wk))
+        else:
+            keys.append((False, mx + wi * wk, mx + (wi + 1) * wk))
+            wi += 1
+    return keys, wk
+
+
+def piano_maps(BW: int, BH: int, SH: int, U: int):
+    """Barres au-dessus de chaque touche + touches qui s'allument (cartes remap),
+    et dessin du clavier (gris + transparence)."""
+    keys, wk = piano_keys(BW)
+    kh = int(min(BH * 0.3, wk * 5.5))
+    gap = max(2, int(U * 0.006))
+    bh = BH - kh - gap
+    lit_row = int(0.55 * (SH - 1))                 # une touche s'allume au-delà de 45 % du niveau
+    bar_of = [-1] * BW                             # barre au-dessus de chaque colonne de pixels
+    white_of, black_of = [-1] * BW, [-1] * BW
+    for k, (blk, x0, x1) in enumerate(keys):
+        c, half = (x0 + x1) / 2, (0.12 if blk else 0.23) * wk
+        for u in range(max(0, int(c - half)), min(BW, int(c + half) + 1)):
+            if c - half <= u + 0.5 <= c + half:
+                bar_of[u] = k
+        for u in range(max(0, int(x0)), min(BW, int(x1) + 1)):
+            if x0 <= u + 0.5 < x1:
+                (black_of if blk else white_of)[u] = k
+                if not blk and (u + 0.5 - x0 < 1.0):   # fin trait entre deux touches blanches
+                    white_of[u] = -2
+
+    def build():
+        xm, ym = array("H"), array("H")
+        for v in range(BH):
+            if v < bh:
+                row = int((1 - (bh - v - 0.5) / bh) * (SH - 1) + 0.5)
+                for u in range(BW):
+                    k = bar_of[u]
+                    xm.append(k if k >= 0 else BAD)
+                    ym.append(row if k >= 0 else BAD)
+            elif v < bh + gap:
+                xm.extend([BAD] * BW)
+                ym.extend([BAD] * BW)
+            else:
+                ty = (v - bh - gap) / kh
+                for u in range(BW):
+                    k = black_of[u] if ty < 0.62 and black_of[u] >= 0 else white_of[u]
+                    xm.append(k if k >= 0 else BAD)
+                    ym.append(lit_row if k >= 0 else BAD)
+        return [xm, ym]
+
+    def drawing(alpha: bool):
+        def build_img():
+            buf = bytearray(BW * BH)
+            for v in range(bh + gap, BH):
+                ty = (v - bh - gap) / kh
+                row = v * BW
+                for u in range(BW):
+                    if ty < 0.62 and black_of[u] >= 0:
+                        val = 255 if alpha else int(16 + 40 * max(0.0, (ty - 0.5) / 0.12))
+                    elif white_of[u] >= 0:
+                        val = 235 if alpha else int(150 + 70 * ty - (40 if ty > 0.95 else 0))
+                    else:
+                        val = 0
+                    buf[row + u] = val
+            return bytes(buf)
+        return cached_gray("clavier_a" if alpha else "clavier", (kh, gap), BW, BH, build_img)
+
+    return cached_maps("piano", (SH, kh, gap, 2), BW, BH, build), drawing(False), drawing(True)
+
+
+def scope_grid(w: int, h: int) -> Path:
+    """Quadrillage discret d'écran d'oscilloscope (axes plus marqués)."""
+    def build():
+        buf = bytearray(w * h)
+        cols, rows = 12, 6
+        for v in range(h):
+            row = v * w
+            for u in range(w):
+                fu, fv = u * cols / w, v * rows / h
+                on = min(abs(fu - round(fu)) * w / cols, abs(fv - round(fv)) * h / rows) < 0.75
+                axis = abs(v + 0.5 - h / 2) < 1.0 or abs(u + 0.5 - w / 2) < 1.0
+                tick = abs(v + 0.5 - h / 2) < max(3, h * 0.012) and (u * cols * 5 / w) % 1 < 1.5 * cols * 5 / w
+                buf[row + u] = 70 if (axis or tick) else (34 if on else 0)
+        return bytes(buf)
+    return cached_gray("grille", (), w, h, build)
 
 
 def ridge_maps(W: int, MH: int, SW: int, SH: int):
@@ -1194,7 +1346,7 @@ def ridge_maps(W: int, MH: int, SW: int, SH: int):
             f = (MH - v - 0.5) / MH
             for u in range(W):
                 d = abs(u + 0.5 - half) / half
-                fe = f / ((0.28 + 0.72 * d ** 1.3) * (0.84 + 0.16 * math.sin(d * 23.0 + 1.3) * math.cos(d * 7.1)))
+                fe = f / _ridge(d)
                 if fe < 1.0:
                     xm.append(min(SW - 1, int((1 - d) * (SW - 1))))
                     ym.append(int((1 - fe) * top + 0.5))
@@ -1202,7 +1354,7 @@ def ridge_maps(W: int, MH: int, SW: int, SH: int):
                     xm.append(BAD)
                     ym.append(BAD)
         return [xm, ym]
-    return cached_maps("ridge", (SW, SH, 2), W, MH, build)
+    return cached_maps("ridge", (SW, SH, 4), W, MH, build)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1285,24 +1437,38 @@ class Graph:
         return ";".join(self.chains)
 
 
-def cqt_src(n: int, rows: int, s: dict, fps: int, decay: float | None = 0.8) -> str:
-    """Spectre vrai-logarithmique 30 Hz → 12 kHz, n bandes, barres blanches nettes."""
+def cqt_src(n: int, rows: int, s: dict, fps: int, decay: float | None = 0.8, tilt: float = 0.0,
+            freqs: tuple[float, float] = (30, 12000), blur: bool = True) -> str:
+    """Spectre vrai-logarithmique (30 Hz → 12 kHz par défaut), n bandes, barres blanches nettes.
+    tilt > 0 : médiums et aigus relevés par rapport aux basses."""
     vol = 4.0 * 2 ** (s["sensitivity"] / 33.0)
+    bv = f"'{vol:.2f}*pow(f/250,{tilt})'" if tilt else f"{vol:.2f}"
     lag = f",lagfun=decay={decay ** (30.0 / fps):.3f}" if decay else ""
-    return (f"showcqt=s={n}x{rows}:fps={fps}:bar_h={rows}:axis_h=0:sono_h=0:bar_g=3:bar_v={vol:.2f}:"
-            f"cscheme=1|1|1|1|1|1:basefreq=30:endfreq=12000,format=gray,"
-            f"gblur=sigma=0.8:sigmaV=0.01,lut=c0='if(gt(val,40),255,0)'{lag}")
+    return (f"showcqt=s={n}x{rows}:fps={fps}:bar_h={rows}:axis_h=0:sono_h=0:bar_g=3:bar_v={bv}:"
+            f"cscheme=1|1|1|1|1|1:basefreq={freqs[0]}:endfreq={freqs[1]},format=gray,"
+            f"{'gblur=sigma=0.8:sigmaV=0.01,' if blur else ''}lut=c0='if(gt(val,40),255,0)'{lag}")
+
+
+def neon_glow(g: Graph, src: str, w: int, h: int, U: float, neon: int, rgb: bool = False) -> str:
+    """Effet néon : copie floue et éclaircie autour des traits (neon de 0 à 100, 50 par défaut).
+    Calculée en quart de taille (rapide), puis agrandie."""
+    if neon <= 0:
+        return src
+    k = neon / 50
+    gain = 1.2 + 1.2 * k
+    sig = max(1.0, U * 0.012 / 4 * (0.7 + 0.3 * k))
+    boost = f"'min(255,val*{gain:.2f})'"
+    lut = f"lutrgb=r={boost}:g={boost}:b={boost}" if rgb else f"lut=c0={boost}"
+    a, b, q, out = g.label(), g.label(), g.label(), g.label()
+    g.add(f"[{src}]split[{a}][{b}];[{b}]scale={even(max(8, w / 4))}:{even(max(8, h / 4))}:flags=bilinear,"
+          f"gblur=sigma={sig:.2f},{lut},scale={w}:{h}:flags=bicubic[{q}];"
+          f"[{a}][{q}]blend=all_mode=lighten[{out}]")
+    return out
 
 
 def colorize(g: Graph, L: dict, mask: str, w: int, h: int, col_png: Path, scroll: bool = False) -> str:
-    """Masque gris → calque coloré (avec lueur néon si demandée)."""
-    if L["s"]["glow"]:
-        a, b, q, m2 = g.label(), g.label(), g.label(), g.label()
-        sig = max(1.0, L["U"] * 0.012 / 4)
-        g.add(f"[{mask}]split[{a}][{b}];[{b}]scale={even(w / 4)}:{even(h / 4)}:flags=bilinear,"
-              f"gblur=sigma={sig:.2f},lut=c0='min(255,val*2.4)',scale={w}:{h}:flags=bicubic[{q}];"
-              f"[{a}][{q}]blend=all_mode=lighten[{m2}]")
-        mask = m2
+    """Masque gris → calque coloré (avec effet néon si demandé)."""
+    mask = neon_glow(g, mask, w, h, L["U"], L["s"]["neon"])
     col = g.still(col_png, "yuva420p")
     if scroll:
         c2 = g.label()
@@ -1398,7 +1564,10 @@ def layer_tunnel(g: Graph, L: dict, s: dict, fps: int, keyed: bool):
     mx, my = g.still(xm), g.still(ym)
     up = f",scale={W}:{H}:flags=bicubic" if (TW, TH) != (W, H) else ""
     key = ",colorkey=black:0.10:0.12" if keyed else ""
-    g.add(f"[{sp}][{mx}][{my}]remap=format=color:fill=black{up},format=rgba{key}[{out}]")
+    tun = g.label()
+    g.add(f"[{sp}][{mx}][{my}]remap=format=color:fill=black,format=rgb24[{tun}]")
+    tun = neon_glow(g, tun, TW, TH, L["U"] * sc, s["neon"] // 2, rgb=True)   # image déjà pleine : lueur plus discrète
+    g.add(f"[{tun}]null{up},format=rgba{key}[{out}]")
     return out, 0, 0
 
 
@@ -1457,9 +1626,10 @@ def outline(g: Graph, mask: str, n: int, fill: float) -> str:
     return out
 
 
-def smooth_cqt(n: int, SW: int, SH: int, s: dict, fps: int, decay: float, sigma: float) -> str:
+def smooth_cqt(n: int, SW: int, SH: int, s: dict, fps: int, decay: float, sigma: float,
+               tilt: float = 0.0) -> str:
     """Spectre aux contours arrondis (pour des formes lisses plutôt que des barres)."""
-    return (f"{cqt_src(n, SH // 2, s, fps, decay)},scale={SW}:{SH}:flags=bicubic,"
+    return (f"{cqt_src(n, SH // 2, s, fps, decay, tilt)},scale={SW}:{SH}:flags=bicubic,"
             f"gblur=sigma={sigma}:sigmaV={sigma / 2},lut=c0='if(gt(val,110),255,0)'")
 
 
@@ -1536,11 +1706,46 @@ def layer_warp(g: Graph, L: dict, s: dict, fps: int):
     return out, 0, 0
 
 
+def layer_piano(g: Graph, L: dict, s: dict, fps: int):
+    """Barres piano : une barre par touche (spectre aligné sur les notes) et clavier qui s'allume."""
+    W, vh, U = L["W"], L["vh"], L["U"]
+    SH = 200
+    (xm, ym), lum, alpha = piano_maps(W, vh, SH, U)
+    stops, vert = scheme_stops(s, L["cover"])
+    col = map_color_image(stops, vert, 88, SH, xm, ym)
+    src = g.label()
+    g.add(f"[0:a]{cqt_src(88, SH, s, fps, 0.68, tilt=0.25, freqs=PIANO_FREQS, blur=False)}[{src}]")
+    notes = colorize(g, L, remap_mask(g, src, xm, ym), W, vh, col)
+    kl, ka, kb, out = g.still(lum, "gray"), g.still(alpha, "gray"), g.label(), g.label()
+    g.add(f"[{kl}]format=yuva420p[{kb}];[{kb}][{ka}]alphamerge[{kb}x];"
+          f"[{kb}x][{notes}]overlay=shortest=1:format=auto[{out}]")
+    return out, 0, L["vy"]
+
+
+def layer_scope(g: Graph, L: dict, s: dict, fps: int):
+    """Oscilloscope : trace lumineuse de l'onde (adoucie), traînée de phosphore et quadrillage."""
+    W, vh, U = L["W"], L["vh"], L["U"]
+    sw = even(min(W, 640))
+    sh = even(max(16, vh * sw / W))
+    vol = 4.5 * 2 ** ((s["sensitivity"] - 50) / 30)
+    stops, vert = scheme_stops(s, L["cover"])
+    grad = grad_image(stops, W, vh, vert)
+    wave, tr, gl = g.label(), g.label(), g.label()
+    th = max(1.0, U / 540)
+    g.add(f"[0:a]aformat=channel_layouts=mono,lowpass=f=1500,lowpass=f=1500,volume={vol:.2f},asoftclip=type=tanh,"
+          f"showwaves=s={sw}x{sh}:mode=p2p:draw=full:rate={fps}:colors=white,fps={fps},format=gray,"
+          f"scale={W}:{vh}:flags=bicubic,gblur=sigma={th:.2f},lut=c0='min(255,val*3.2)',"
+          f"lagfun=decay={0.62 ** (30 / fps):.3f}[{wave}]")
+    grid = g.still(scope_grid(W, vh), "gray")
+    g.add(f"[{wave}][{grid}]blend=all_mode=lighten[{tr}]")
+    return colorize(g, L, tr, W, vh, grad), 0, L["vy"]
+
+
 def layer_synthwave(g: Graph, L: dict, s: dict, fps: int):
     sc = min(1.0, 1280 / L["W"])                            # calcul allégé, puis agrandi
     W, H, U = even(L["W"] * sc), even(L["H"] * sc), L["U"] * sc
     hz, rc, fy = even(L["hz"] * sc), L["rc"] * sc, L["fy"] * sc
-    nrows, MH = H - hz, even(min(U * 0.2, hz * 0.6))
+    nrows, MH = H - hz, even(min(U * 0.27, hz * 0.7))
     y0 = even(max(0, min(hz - MH, fy - rc * 2.6)))          # le calque commence avec le halo du soleil
     K, cell = 512, 0.118
     strip, vl = synth_floor(W, nrows, K, cell, 12)
@@ -1549,18 +1754,23 @@ def layer_synthwave(g: Graph, L: dict, s: dict, fps: int):
     stops, _ = scheme_stops(s, L["cover"])
     grad = grad_image(stops, W, H - y0, True)
     pos = beat_positions(L, K / (0.42 * fps), 1.6)
-    cmds = frame_cmds(fps, ("crop@fz", "x", [int(p) % K for p in pos]), ("color@sg", "c", flash_values(L, 0.62)))
+    cmds = frame_cmds(fps, ("crop@fz", "x", [int(p) % K for p in pos]), ("color@sg", "c", flash_values(L, 0.8)))
     st, v = g.still(strip), g.still(vl)
     src, hl, fl2, mask, lit = (g.label() for _ in range(5))
-    quiet = dict(s, sensitivity=s["sensitivity"] - 60)            # de la marge : pas de plateaux
-    g.add(f"[0:a]{smooth_cqt(96, SW, SH, quiet, fps, 0.9, 3.5)}[{src}]")
-    mnt = outline(g, remap_mask(g, src, xm, ym), max(1, round(U / 450)), 0.22)
+    quiet = dict(s, sensitivity=s["sensitivity"] - 42)            # de la marge : pas de plateaux
+    g.add(f"[0:a]{smooth_cqt(96, SW, SH, quiet, fps, 0.9, 4.5, tilt=0.4)}[{src}]")
+    rm, base = g.label(), g.still(ridge_base(W, MH), "gray")
+    g.add(f"[{remap_mask(g, src, xm, ym)}][{base}]blend=all_mode=lighten[{rm}]")
+    mnt = outline(g, rm, max(1, round(U / 300)), 0.32)
     g.add(f"[{st}]sendcmd=f='{ffpath(cmds)}',crop@fz=w=1:h={nrows}:x=0:y=0,"
           f"scale={W}:{nrows}:flags=neighbor[{hl}];[{hl}][{v}]blend=all_mode=lighten[{fl2}];"
           f"[{mnt}][{fl2}]vstack,pad={W}:{H - y0}:0:{hz - MH - y0}:black[{mask}]")
     halo = g.still(halo_image(W, H - y0, W / 2, fy - y0, rc, rc * 0.55, 0.5))
     g.add(f"[{mask}][{halo}]blend=all_mode=lighten[{lit}]")
-    out = colorize(g, dict(L, U=U), flash(g, lit, W, H - y0, fps, "sg"), W, H - y0, grad)
+    scene = colorize(g, dict(L, U=U), flash(g, lit, W, H - y0, fps, "sg"), W, H - y0, grad)
+    bd, al, bk, out = g.label(), g.still(synth_backdrop(W, H - y0, hz - y0, fy - y0, rc), "gray"), g.label(), g.label()
+    g.add(f"color=c=0x0b0420:s={W}x{H - y0}:r={fps},format=yuva420p[{bd}];"
+          f"[{bd}][{al}]alphamerge=shortest=1[{bk}];[{bk}][{scene}]overlay=shortest=1:format=auto[{out}]")
     oh = even((H - y0) / sc)
     if sc < 1.0:
         up = g.label()
@@ -1616,9 +1826,15 @@ def style_layer(g: Graph, L: dict, s: dict, fps: int, keyed: bool):
         return layer_warp(g, L, s, fps)
     if st == "synthwave":
         return layer_synthwave(g, L, s, fps)
-    out = g.label()
+    if st == "cqt":
+        return layer_piano(g, L, s, fps)
+    if st == "scope":
+        return layer_scope(g, L, s, fps)
+    raw, out = g.label(), g.label()
     key = ",colorkey=black:0.12:0.08" if keyed else ""
-    g.add(f"[0:a]{visualizer(s, L['W'], L['vh'], fps, keyed)},format=rgba{key}[{out}]")
+    g.add(f"[0:a]{visualizer(s, L['W'], L['vh'], fps, keyed)},format=rgb24[{raw}]")
+    lit = neon_glow(g, raw, L["W"], L["vh"], L["U"], s["neon"] // (2 if st == "spectrum" else 1), rgb=True)
+    g.add(f"[{lit}]format=rgba{key}[{out}]")
     return out, 0, L["vy"]
 
 
@@ -3105,7 +3321,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
                 <option value="fire">Feu</option><option value="cool">Froid</option><option value="magma">Magma</option>
                 <option value="viridis">Viridis</option><option value="plasma">Plasma</option><option value="nebulae">Nébuleuse</option>
               </select></div>
-            <div class="row" id="r-glow"><label>Lueur</label><label class="check"><input type="checkbox" data-k="glow"><span>Effet néon</span></label></div>
+            <div class="row" id="r-glow"><label>Effet néon</label><div class="inline"><input type="range" min="0" max="100" step="10" data-k="neon"><output id="o-neon"></output></div></div>
           </div>
           <div>
             <div class="row"><label id="l-size">Taille</label><div class="inline"><input type="range" min="15" max="100" step="5" data-k="viz_size"><output id="o-size"></output></div></div>
@@ -3243,8 +3459,8 @@ const STYLES = {
   spectrum:["Spectrogramme",'<svg viewBox="0 0 60 34"><defs><linearGradient id="g2" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#2a0a5e"/><stop offset=".5" stop-color="#e0407a"/><stop offset="1" stop-color="#ffe08a"/></linearGradient></defs>'+Array.from({length:14},(_,i)=>`<rect x="${2+i*4}" y="${4+((i*7)%9)}" width="3.6" height="${28-((i*7)%9)}" fill="url(#g2)" opacity="${.45+((i*3)%5)/9}"/>`).join("")+'</svg>'],
   scope:["Oscilloscope",'<svg viewBox="0 0 60 34"><path d="M30 4 C44 4 44 30 30 30 C16 30 16 4 30 4 Z M22 10 L38 24 M38 10 L22 24" fill="none" stroke="currentColor" stroke-width="1.8" opacity=".85"/></svg>']
 };
-const MASK = ["circle","retro","mirror","cubes","aurora","mandala","synthwave","warp"],
-      ROUND = ["circle","tunnel","mandala","synthwave","warp"], CQT = ["circle","retro","mirror","cubes","mandala","synthwave"];
+const MASK = ["circle","retro","mirror","cubes","aurora","mandala","synthwave","warp","cqt","scope"],
+      ROUND = ["circle","tunnel","mandala","synthwave","warp"], CQT = ["circle","retro","mirror","cubes","mandala","synthwave","cqt","scope"];
 let S = null, settings = null, checked = new Set(), seen = new Set(), selected = null, saveT = null, lastImgs = "", cvName = null;
 let globalSet = null, tracks = {}, pendingSave = null;   // réglages communs / propres à certains morceaux
 let order = [], mixOn = false;                           // une seule vidéo : ordre des morceaux
@@ -3310,14 +3526,14 @@ function applySettings(){
   $("#o-size").textContent = (!rnd && settings.viz_size >= 100) ? "Plein" : settings.viz_size + " %";
   $("#o-sens").textContent = settings.sensitivity + " %";
   $("#o-pulse").textContent = settings.pulse ? settings.pulse + " %" : "Aucune";
+  $("#o-neon").textContent = settings.neon ? settings.neon + " %" : "Aucun";
   $("#l-size").textContent = !rnd ? "Taille" : sts.every(x => x === "synthwave") ? "Taille du soleil"
                             : sts.every(x => ["synthwave","warp"].includes(x)) ? "Taille de la jaquette" : "Taille du cercle";
   const solid = ["solid","duo"].includes(settings.colors);
   $("#r-scheme").classList.toggle("hide", !mask);
-  $("#r-color").classList.toggle("hide", !(sts.some(x => ["waves","bars","scope"].includes(x)) || (mask && solid)));
+  $("#r-color").classList.toggle("hide", !(sts.some(x => ["waves","bars"].includes(x)) || (mask && solid)));
   $("#color2").hidden = !(mask && settings.colors === "duo");
   $("#r-palette").classList.toggle("hide", !sts.some(x => ["spectrum","tunnel"].includes(x)));
-  $("#r-glow").classList.toggle("hide", !mask);
   $("#r-sens").classList.toggle("hide", !sts.some(x => CQT.includes(x)));
   $("#r-pos").classList.toggle("hide", rnd || settings.viz_size >= 100);
   $("#r-effect").classList.toggle("hide", img === "__none__");
@@ -3383,7 +3599,7 @@ function bindInputs(){
       const k = inp.dataset.k;
       if (inp.type === "radio" && !inp.checked) return;
       let v = inp.type === "checkbox" ? inp.checked : inp.value;
-      if (["viz_size","fps","crf","audio_kbps","pulse","sensitivity","rotate_minutes"].includes(k)) v = parseInt(v,10);
+      if (["viz_size","fps","crf","audio_kbps","pulse","sensitivity","rotate_minutes","neon"].includes(k)) v = parseInt(v,10);
       settings[k] = v;
       if (k === "rotate" && v && !settings.rotate_styles.length) settings.rotate_styles = [settings.style];
       applySettings(); changed();
