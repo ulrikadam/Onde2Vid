@@ -391,7 +391,7 @@ _probe_cache: dict = {}
 
 def probe(path: Path) -> dict:
     """Durée, pochette intégrée, dimensions et tags (via ffmpeg -i)."""
-    empty = {"duration": 0.0, "cover": False, "w": 0, "h": 0, "title": "", "artist": ""}
+    empty = {"duration": 0.0, "cover": False, "w": 0, "h": 0, "title": "", "artist": "", "rate": 0}
     if not TOOLS["ffmpeg"]:
         return dict(empty)
     try:
@@ -407,6 +407,9 @@ def probe(path: Path) -> dict:
     if m:
         info["duration"] = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
     info["cover"] = bool(re.search(r"Video:.*\(attached pic\)", err))
+    m = re.search(r"Audio: .*?(\d{4,6}) Hz", err)
+    if m:
+        info["rate"] = int(m[1])
     m = re.search(r"Video: .*?[ ,](\d{2,5})x(\d{2,5})[ ,\[]", err)
     if m:
         info["w"], info["h"] = int(m[1]), int(m[2])
@@ -596,58 +599,81 @@ BROWSER_AUDIO_MIMES = {
 _peaks_cache: dict = {}
 
 
-def audio_peaks(mp3: Path, n: int = 320) -> list[float]:
-    """Forme d'onde (n barres normalisées entre 0 et 1) pour l'outil de découpe."""
-    if not TOOLS["ffmpeg"]:
-        return [0.1] * n
-    key = (file_key(mp3), n)
-    if key in _peaks_cache:
-        return _peaks_cache[key]
-    dur = probe(mp3)["duration"] or 60.0
-    raw = b""
-    if dur > 480:
-        nslices, workers = 64, 4
-        per_w = nslices // workers
-        is_mp3 = mp3.suffix.lower() == ".mp3"
+PEAK_SR = 8000                 # échantillonnage de l'analyse (garde les sons jusqu'à 4 kHz)
 
-        def _batch(w: int) -> bytes:
-            cmd = [TOOLS["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostdin"]
-            for j in range(per_w):
-                t = (w * per_w + j + 0.5) * dur / nslices
-                if is_mp3:
-                    cmd += ["-usetoc", "1"]
-                cmd += ["-ss", f"{t:.2f}", "-t", "0.25", "-i", str(mp3)]
-            fc = "".join(f"[{j}:a]" for j in range(per_w)) + f"concat=n={per_w}:v=0:a=1,aresample=1200[a]"
-            cmd += ["-filter_complex", fc, "-map", "[a]", "-ac", "1", "-f", "s16le", "-"]
-            return subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, **NO_WINDOW).stdout
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            raw = b"".join(ex.map(_batch, range(workers)))
-    if not raw:
-        sr = max(100, min(1600, int(n * 24 / max(1.0, dur))))
-        cmd = [TOOLS["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostdin",
-               "-i", str(mp3), "-vn", "-ac", "1", "-af", f"aresample={sr}", "-f", "s16le", "-"]
-        raw = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, **NO_WINDOW).stdout
+def _decode(mp3: Path, start: float, dur: float, sr: int = PEAK_SR) -> array:
+    """Son mono 16 bits d'un passage, pour l'analyse (forme d'onde, silences)."""
+    cmd = [TOOLS["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-t", f"{dur:.3f}", "-i", str(mp3), "-vn", "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"]
+    raw = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, **NO_WINDOW).stdout
     a = array("h")
     a.frombytes(raw[:len(raw) // 2 * 2])
     if sys.byteorder == "big":
         a.byteswap()
-    total = len(a)
-    if not total:
-        return [0.05] * n
+    return a
+
+
+def audio_peaks(mp3: Path, n: int = 2000, start: float = 0.0, end: float | None = None) -> dict:
+    """Forme d'onde : n crêtes (0 à 1, pleine échelle) entre start et end, sur tout le son décodé
+    (les longs morceaux sont analysés en plusieurs parties en même temps). ref : niveau de référence
+    du morceau entier pour l'affichage."""
+    if not TOOLS["ffmpeg"]:
+        return {"peaks": [0.1] * n, "ref": 1.0}
+    total = probe(mp3)["duration"] or 60.0
+    start = max(0.0, min(start, total))
+    end = total if end is None else max(start + 0.05, min(end, total))
+    key = (file_key(mp3), n, round(start, 2), round(end, 2))
+    if key in _peaks_cache:
+        return _peaks_cache[key]
+    span = end - start
+    parts = 1 if span <= 600 else min(8, max(2, os.cpu_count() or 2))
+    sr = PEAK_SR if span <= 1800 else 4000
+    cuts = [start + span * k / parts for k in range(parts + 1)]
+    with ThreadPoolExecutor(max_workers=parts) as ex:
+        chunks = list(ex.map(lambda k: _decode(mp3, cuts[k], cuts[k + 1] - cuts[k], sr), range(parts)))
+    a = array("h")
+    for c in chunks:
+        a.extend(c)
+    total_n = len(a)
     vals = []
     for i in range(n):
-        seg = a[i * total // n:(i + 1) * total // n]
-        if seg:
-            pk = max(abs(min(seg)), abs(max(seg)))
-            rms = (sum(x * x for x in seg) / len(seg)) ** 0.5
-            vals.append(pk * 0.45 + rms * 0.55)
-        else:
-            vals.append(0.0)
-    ref = sorted(vals)[int(len(vals) * 0.98)] or 1.0
-    out = [round(min(1.0, max(0.03, (v / ref) ** 0.85)), 3) for v in vals]
+        seg = a[i * total_n // n:(i + 1) * total_n // n]
+        vals.append(max(-min(seg), max(seg)) / 32768 if seg else 0.0)
+    ref = sorted(vals)[int(len(vals) * 0.99)] if vals else 1.0
+    out = {"peaks": [round(v, 4) for v in vals], "ref": max(0.02, ref)}
+    if len(_peaks_cache) > 64:
+        _peaks_cache.clear()
     _peaks_cache[key] = out
     return out
+
+
+def silence_edges(mp3: Path, db: float = -48.0) -> tuple[float, float]:
+    """Début et fin du son utile : silences retirés au début et à la fin (analyse de 90 s de chaque côté)."""
+    total = probe(mp3)["duration"]
+    thr = int(32768 * 10 ** (db / 20))
+    blk = PEAK_SR // 50                                    # blocs de 20 ms
+    look = min(90.0, total)
+    head = _decode(mp3, 0.0, look)
+    start = 0.0
+    for i in range(0, len(head), blk):
+        b = head[i:i + blk]
+        if max(b) > thr or -min(b) > thr:
+            start = max(0.0, i / PEAK_SR - 0.05)
+            break
+    t0 = max(0.0, total - look)
+    tail = _decode(mp3, t0, total - t0 + 1)
+    end = total
+    for i in range(len(tail) - blk, -1, -blk):
+        b = tail[max(0, i):i + blk]
+        if b and (max(b) > thr or -min(b) > thr):
+            end = min(total, t0 + (i + blk) / PEAK_SR + 0.25)
+            break
+    if end - start < 0.5:
+        return 0.0, total
+    return round(start, 2), round(end, 2)
 
 
 def browser_audio(mp3: Path, compat: bool = False) -> tuple[Path, str]:
@@ -691,13 +717,14 @@ def trim_audio(mp3: Path, opts: dict, full_track: bool = False,
     except (TypeError, ValueError):
         fade_in = fade_out = 0.0
     keep_meta = bool(opts.get("keep_meta", True))
+    loud = _pick(opts.get("loudness"), ["none", "-14", "-9"], "none")      # LUFS visés (YouTube, Spotify…)
     dest_mode = opts.get("dest_mode")
     if dest_mode not in ("copy_both", "replace_orig", "copy_out"):
         dest_mode = "copy_both" if opts.get("to_input", True) else "copy_out"
     replace_orig = (dest_mode == "replace_orig")
     overwrite = bool(opts.get("overwrite", False)) or replace_orig
 
-    if fmt == "copy" and (fade_in > 0 or fade_out > 0):
+    if fmt == "copy" and (fade_in > 0 or fade_out > 0 or loud != "none"):
         src_fmt = mp3.suffix.lower().lstrip(".")
         fmt = src_fmt if src_fmt in ("mp3", "m4a", "wav", "flac", "ogg", "opus") else "mp3"
 
@@ -720,6 +747,8 @@ def trim_audio(mp3: Path, opts: dict, full_track: bool = False,
     part = out.with_name(f".{out.stem}.part{ext}")
 
     af = []
+    if loud != "none":
+        af.append(f"loudnorm=I={loud}:TP=-1:LRA=11")
     if fmt != "copy":
         fi = min(fade_in, dur)
         fo = min(fade_out, dur)
@@ -767,6 +796,8 @@ def trim_audio(mp3: Path, opts: dict, full_track: bool = False,
             args += ["-map", "0:a:0", "-vn"]
         if af:
             args += ["-af", ",".join(af)]
+            if loud != "none":                  # loudnorm travaille en 192 kHz : on revient à la normale
+                args += ["-ar", "48000" if fmt == "opus" else str(min(48000, max(44100, info["rate"] or 44100)))]
         args += cargs
         if keep_meta:
             args += ["-map_metadata", "0"]
@@ -3426,10 +3457,25 @@ class Handler(BaseHTTPRequestHandler):
             if not (mp3.is_file() and mp3.suffix.lower() in AUDIO_EXT):
                 return self._json({"ok": False, "error": "Morceau introuvable"})
             info = probe(mp3)
+            try:
+                a = float(q.get("start", ["0"])[0])
+                b = float(q["end"][0]) if "end" in q else None
+            except ValueError:
+                a, b = 0.0, None
+            n = _clamp_int(q.get("n", ["2000"])[0], 50, 4000, 2000)
+            pk = audio_peaks(mp3, n, a, b)
             self._json({"ok": True, "name": mp3.name, "stem": mp3.stem,
                         "ext": mp3.suffix.lower().lstrip("."),
                         "duration": info["duration"], "title": info["title"],
-                        "artist": info["artist"], "peaks": audio_peaks(mp3)})
+                        "artist": info["artist"], "peaks": pk["peaks"], "ref": pk["ref"],
+                        "start": a, "end": b if b is not None else info["duration"]})
+        elif url.path == "/api/silence":
+            ensure_tools()
+            mp3 = INPUT_DIR / Path(unquote(q.get("name", [""])[0])).name
+            if not (mp3.is_file() and mp3.suffix.lower() in AUDIO_EXT) or not TOOLS["ffmpeg"]:
+                return self._json({"ok": False, "error": "Morceau introuvable"})
+            a, b = silence_edges(mp3)
+            self._json({"ok": True, "start": a, "end": b})
         elif url.path == "/api/thumb":
             mp3 = INPUT_DIR / Path(unquote(q.get("name", [""])[0])).name
             size = _clamp_int(q.get("s", ["160"])[0], 40, 600, 160)
@@ -4241,7 +4287,15 @@ input[type=range]{width:100%;accent-color:var(--accent)}
             <button class="btn small" id="trTestEnd" title="Écouter les 3 dernières secondes de l'extrait (et son fondu)">⏭ Tester la fin</button>
             <label class="check" style="font-size:12.5px"><input type="checkbox" id="trLoop"><span>Boucler</span></label>
             <div class="grow"></div>
+            <button class="btn small" id="trSilence" title="Place le début et la fin là où le son commence et s'arrête vraiment">✨ Retirer les silences</button>
             <button class="btn small" id="trFull" title="Sélectionner tout le morceau (de 0:00 à la fin)">Tout le morceau</button>
+          </div>
+          <div class="tr-bar">
+            <span class="pill" id="trZoomPill">Vue : tout</span>
+            <button class="btn small" id="trZoomIn" title="Zoomer (touche +, ou molette sur l'onde)">🔍 +</button>
+            <button class="btn small" id="trZoomOut" title="Dézoomer (touche -)">🔍 −</button>
+            <button class="btn small" id="trZoomSel" title="Voir l'extrait en entier">Voir l'extrait</button>
+            <button class="btn small" id="trZoomAll" title="Voir tout le morceau (touche 0)">Voir tout</button>
           </div>
           <div class="tr-times">
             <div class="tbox">
@@ -4265,7 +4319,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
               </div>
             </div>
           </div>
-          <p class="hint">Glisse les poignées sur la forme d'onde pour choisir le début et la fin, ou clique dedans pour déplacer le curseur d'écoute.</p>
+          <p class="hint">Glisse les poignées pour choisir le début et la fin, clique dans l'onde pour déplacer le curseur d'écoute, et zoome avec la molette pour couper au dixième de seconde. Raccourcis : <b>Espace</b> écouter / pause · <b>I</b> et <b>O</b> début et fin au curseur · <b>← →</b> avancer d'1 s (avec Maj : 0,1 s) · <b>+ −</b> zoom · <b>0</b> tout voir.</p>
         </div>
       </div>
     </div>
@@ -4287,6 +4341,12 @@ input[type=range]{width:100%;accent-color:var(--accent)}
               <select id="trWavBits">
                 <option value="16" selected>16 bits (qualité CD)</option>
                 <option value="24">24 bits (studio)</option>
+              </select></div>
+            <div class="row"><label>Volume</label>
+              <select id="trLoud">
+                <option value="none" selected>Inchangé</option>
+                <option value="-14">Normalisé (YouTube, Spotify : −14 LUFS)</option>
+                <option value="-9">Plus fort (club : −9 LUFS)</option>
               </select></div>
             <div class="row"><label>Fondu d'entrée</label>
               <select id="trFadeIn">
@@ -4747,7 +4807,7 @@ function buildAudioFmts(){
 
 function applyTrimFmt(){
   $$("#trFmts .fmt-btn").forEach(b => b.classList.toggle("on", b.dataset.fmt === trFmt));
-  const hasFades = Number($("#trFadeIn").value) > 0 || Number($("#trFadeOut").value) > 0;
+  const hasFades = Number($("#trFadeIn").value) > 0 || Number($("#trFadeOut").value) > 0 || $("#trLoud").value !== "none";
   const effFmt = (trFmt === "copy" && hasFades)
     ? (["mp3","m4a","wav","flac","ogg","opus"].includes(trOrigExt) ? trOrigExt : "mp3")
     : trFmt;
@@ -4771,7 +4831,7 @@ function applyTrimFmt(){
     ? "⚠ Le fichier d'origine dans input/ sera remplacé par cette nouvelle version (et copié dans output/)."
     : "Le fichier d'origine est conservé intact.";
   if (trFmt === "copy" && hasFades){
-    hint += ` Comme un fondu est activé, le fichier sera réencodé en .${effFmt}.`;
+    hint += ` Comme un fondu ou le réglage du volume est activé, le fichier sera réencodé en .${effFmt}.`;
   } else if (keep && !coverOk){
     hint += ` Le format ${ext.toUpperCase()} n'embarque pas de pochette dans le fichier (si tu l'ajoutes à input/, sa jaquette est conservée à part).`;
   }
@@ -4843,7 +4903,8 @@ async function syncTrimTrack(){
   $("#trErr").hidden = true;
   trDur = (f && f.duration) || 0;
   trStart = 0; trEnd = trDur; trCurTime = 0;
-  trPeaks = [];
+  trPeaks = []; trDetail = null; trRef = 1; trView = {a: 0, b: trDur};
+  $("#trZoomPill").textContent = "Vue : tout";
   updateTrimTimesUI();
   applyTrimFmt();
   $("#waveWrap").classList.add("loading");
@@ -4855,8 +4916,8 @@ async function syncTrimTrack(){
     const j = await r.json();
     if (trTrack !== target) return;
     if (j.ok){
-      if (!trDur && j.duration){ trDur = j.duration; trEnd = trDur; }
-      trPeaks = j.peaks || [];
+      if (!trDur && j.duration){ trDur = j.duration; trEnd = trDur; trView = {a: 0, b: trDur}; }
+      trPeaks = j.peaks || []; trRef = j.ref || 1;
       $("#trTagTitle").value = j.title || trStem;
       $("#trTagArtist").value = j.artist || "";
       updateTrimTimesUI();
@@ -4865,6 +4926,48 @@ async function syncTrimTrack(){
   }catch(e){}
   $("#waveWrap").classList.remove("loading");
   drawWave();
+}
+
+/* vue de la forme d'onde : zoom (molette, boutons, touches + / -) et détail précis quand on zoome */
+let trView = {a: 0, b: 0}, trRef = 1, trDetail = null, trDetT = 0;
+const WPAD = 12;
+function viewSpan(){ return Math.max(0.05, trView.b - trView.a); }
+function setView(a, b){
+  if (!trDur) return;
+  let span = Math.max(Math.min(0.5, trDur), Math.min(trDur, b - a));
+  a = Math.max(0, Math.min(a, trDur - span));
+  trView = {a, b: a + span};
+  $("#trZoomPill").textContent = span >= trDur - 0.01 ? "Vue : tout" : `Zoom ×${(trDur / span).toFixed(trDur / span < 10 ? 1 : 0).replace(".", ",")}`;
+  clearTimeout(trDetT);
+  if (span < trDur * 0.6){
+    const want = trTrack, pad = span * 0.5, s0 = Math.max(0, a - pad), s1 = Math.min(trDur, a + span + pad);
+    if (!(trDetail && trDetail.track === want && trDetail.a <= a && trDetail.b >= a + span && (trDetail.b - trDetail.a) < span * 3))
+      trDetT = setTimeout(async () => {
+        try{
+          const r = await fetch(`/api/peaks?name=${enc(want)}&start=${s0.toFixed(3)}&end=${s1.toFixed(3)}&n=1600`, {cache:"no-store"});
+          const j = await r.json();
+          if (j.ok && trTrack === want){ trDetail = {track: want, a: s0, b: s1, peaks: j.peaks}; drawWave(); }
+        }catch(e){}
+      }, 220);
+  }
+  drawWave();
+}
+function zoomAt(t, k){ const span = viewSpan() * k; const f = (t - trView.a) / viewSpan(); setView(t - f * span, t - f * span + span); }
+function peakBetween(t0, t1){
+  let src = null;
+  if (trDetail && trDetail.track === trTrack && t0 >= trDetail.a && t1 <= trDetail.b) src = trDetail;
+  else if (trPeaks.length) src = {a: 0, b: trDur, peaks: trPeaks};
+  if (!src) return 0;
+  const N = src.peaks.length, sp = src.b - src.a;
+  let i0 = Math.floor((t0 - src.a) / sp * N), i1 = Math.ceil((t1 - src.a) / sp * N);
+  i0 = Math.max(0, Math.min(N - 1, i0)); i1 = Math.max(i0 + 1, Math.min(N, i1));
+  let m = 0;
+  for (let i = i0; i < i1; i++) if (src.peaks[i] > m) m = src.peaks[i];
+  return Math.min(1, Math.max(0.03, Math.pow(m / trRef, 0.8)));
+}
+function niceStep(span, px){
+  const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+  return steps.find(s => span / s <= px / 90) || 3600;
 }
 
 function drawWave(){
@@ -4889,27 +4992,24 @@ function drawWave(){
     ctx.restore();
     return;
   }
-  const padX = 12, uw = W - 2 * padX;
-  const xOf = t => padX + Math.max(0, Math.min(1, t / trDur)) * uw;
+  if (!(trView.b > trView.a)) trView = {a: 0, b: trDur};
+  const uw = W - 2 * WPAD, va = trView.a, span = viewSpan();
+  const xOf = t => WPAD + (t - va) / span * uw;
   const xs = xOf(trStart), xe = xOf(trEnd), xc = xOf(trCurTime);
   const fi = Number($("#trFadeIn").value) || 0, fo = Number($("#trFadeOut").value) || 0;
   const selDur = Math.max(0.01, trEnd - trStart);
 
-  // Zone sélectionnée
   ctx.fillStyle = "rgba(107, 92, 255, 0.13)";
-  ctx.fillRect(xs, 0, Math.max(1, xe - xs), H);
+  const sx0 = Math.max(0, xs), sx1 = Math.min(W, xe);
+  if (sx1 > sx0) ctx.fillRect(sx0, 0, sx1 - sx0, H);
 
-  // Barres de l'onde
-  const n = trPeaks.length, step = uw / n, bw = Math.max(1.4, step * 0.66);
+  const nb = Math.max(40, Math.floor(uw / 3)), step = uw / nb, bw = Math.max(1.2, step * 0.66);
   const midY = (H - 18) / 2 + 6, maxH = (H - 38) / 2;
-  const grad = ctx.createLinearGradient(xs, 0, xe, 0);
-  grad.addColorStop(0, "#00e5ff");
-  grad.addColorStop(0.5, "#6b5cff");
-  grad.addColorStop(1, "#ff3df5");
-
-  for (let i = 0; i < n; i++){
-    const bx = padX + (i + 0.5) * step;
-    const bt = (i + 0.5) / n * trDur;
+  const grad = ctx.createLinearGradient(Math.max(0, xs), 0, Math.min(W, xe), 0);
+  grad.addColorStop(0, "#00e5ff"); grad.addColorStop(0.5, "#6b5cff"); grad.addColorStop(1, "#ff3df5");
+  for (let i = 0; i < nb; i++){
+    const t0 = va + i / nb * span, t1 = va + (i + 1) / nb * span, bt = (t0 + t1) / 2;
+    const bx = WPAD + (i + 0.5) * step;
     const inSel = bt >= trStart && bt <= trEnd;
     let env = 1;
     if (inSel && trFmt !== "copy"){
@@ -4917,71 +5017,64 @@ function drawWave(){
       if (fi > 0 && rel < fi) env *= Math.max(0.08, rel / Math.min(fi, selDur));
       if (fo > 0 && rem < fo) env *= Math.max(0.08, rem / Math.min(fo, selDur));
     }
-    const bh = Math.max(2, trPeaks[i] * maxH * env);
+    const bh = Math.max(1.5, peakBetween(t0, t1) * maxH * env);
     ctx.fillStyle = inSel ? grad : "rgba(140, 140, 165, 0.25)";
-    ctx.beginPath();
-    ctx.roundRect(bx - bw / 2, midY - bh, bw, bh * 2, 1.5);
-    ctx.fill();
+    ctx.beginPath(); ctx.roundRect(bx - bw / 2, midY - bh, bw, bh * 2, 1.2); ctx.fill();
   }
 
-  // Courbes de fondu (fade in / fade out)
   if (trFmt !== "copy" && (fi > 0 || fo > 0)){
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.45)";
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([4, 3]);
-    if (fi > 0){
-      const xfi = xOf(Math.min(trEnd, trStart + fi));
-      ctx.beginPath(); ctx.moveTo(xs, H - 22); ctx.lineTo(xfi, 14); ctx.stroke();
-    }
-    if (fo > 0){
-      const xfo = xOf(Math.max(trStart, trEnd - fo));
-      ctx.beginPath(); ctx.moveTo(xfo, 14); ctx.lineTo(xe, H - 22); ctx.stroke();
-    }
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.45)"; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+    if (fi > 0){ const x1 = xOf(Math.min(trEnd, trStart + fi)); ctx.beginPath(); ctx.moveTo(xs, H - 22); ctx.lineTo(x1, 14); ctx.stroke(); }
+    if (fo > 0){ const x0 = xOf(Math.max(trStart, trEnd - fo)); ctx.beginPath(); ctx.moveTo(x0, 14); ctx.lineTo(xe, H - 22); ctx.stroke(); }
     ctx.setLineDash([]);
   }
 
-  // Graduations de temps en bas
   ctx.fillStyle = "rgba(180, 180, 200, 0.55)";
   ctx.font = "10.5px -apple-system, BlinkMacSystemFont, sans-serif";
   ctx.textAlign = "center";
-  const ticksN = Math.max(3, Math.min(8, Math.floor(uw / 85)));
-  for (let i = 0; i <= ticksN; i++){
-    const t = (i / ticksN) * trDur, tx = xOf(t);
+  const st = niceStep(span, uw);
+  for (let t = Math.ceil(va / st) * st; t <= va + span + 1e-6; t += st){
+    const tx = xOf(t);
+    if (tx < WPAD + 14 || tx > W - WPAD - 14) continue;
     ctx.fillRect(tx - 0.5, H - 16, 1, 4);
-    if (i > 0 && i < ticksN) ctx.fillText(fmt(t), tx, H - 4);
+    ctx.fillText(st < 1 ? fmtPrecise(t) : fmt(t), tx, H - 4);
   }
 
-  // Curseur de lecture
-  if (trCurTime >= 0 && trCurTime <= trDur){
-    ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 1.8;
+  if (trCurTime >= va && trCurTime <= va + span){
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1.8;
     ctx.beginPath(); ctx.moveTo(xc, 0); ctx.lineTo(xc, H - 16); ctx.stroke();
-    ctx.fillStyle = "#ffffff";
-    ctx.beginPath(); ctx.arc(xc, 6, 3.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ffffff"; ctx.beginPath(); ctx.arc(xc, 6, 3.5, 0, Math.PI * 2); ctx.fill();
   }
 
-  // Poignées Début et Fin
   const drawHandle = (x, col, label, leftAlign) => {
-    ctx.strokeStyle = col;
-    ctx.lineWidth = 2.5;
+    if (x < -8 || x > W + 8) return;
+    ctx.strokeStyle = col; ctx.lineWidth = 2.5;
     ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
-    ctx.fillStyle = col;
-    ctx.beginPath(); ctx.roundRect(x - 6, midY - 16, 12, 32, 5); ctx.fill();
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(x - 2, midY - 7, 1, 14);
-    ctx.fillRect(x + 1, midY - 7, 1, 14);
+    ctx.fillStyle = col; ctx.beginPath(); ctx.roundRect(x - 6, midY - 16, 12, 32, 5); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.fillRect(x - 2, midY - 7, 1, 14); ctx.fillRect(x + 1, midY - 7, 1, 14);
     ctx.font = "600 10.5px -apple-system, BlinkMacSystemFont, sans-serif";
     const tw = ctx.measureText(label).width + 10;
     const lx = leftAlign ? Math.min(W - tw - 2, x + 4) : Math.max(2, x - tw - 4);
-    ctx.fillStyle = col;
-    ctx.beginPath(); ctx.roundRect(lx, 4, tw, 17, 5); ctx.fill();
-    ctx.fillStyle = "#fff";
-    ctx.textAlign = "left";
-    ctx.fillText(label, lx + 5, 16);
+    ctx.fillStyle = col; ctx.beginPath(); ctx.roundRect(lx, 4, tw, 17, 5); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.textAlign = "left"; ctx.fillText(label, lx + 5, 16);
   };
   drawHandle(xs, "#6b5cff", fmtPrecise(trStart), true);
   drawHandle(xe, "#ff3df5", fmtPrecise(trEnd), false);
+  // aperçu du morceau entier quand on est zoomé
+  if (span < trDur - 0.01){
+    const ow = W - 2 * WPAD;
+    ctx.fillStyle = "rgba(255,255,255,0.10)"; ctx.fillRect(WPAD, H - 3, ow, 3);
+    ctx.fillStyle = "rgba(255,255,255,0.55)"; ctx.fillRect(WPAD + va / trDur * ow, H - 3, Math.max(3, span / trDur * ow), 3);
+  }
   ctx.restore();
+}
+
+function seekTo(t){
+  const aud = $("#trAudio");
+  trCurTime = Math.max(0, Math.min(trDur, t));
+  aud.currentTime = trCurTime;
+  if (trCurTime < trView.a || trCurTime > trView.b) setView(trCurTime - viewSpan() * 0.2, trCurTime + viewSpan() * 0.8);
+  drawWave();
 }
 
 function bindWaveform(){
@@ -4989,10 +5082,9 @@ function bindWaveform(){
   const posFromEvent = e => {
     const r = cv.getBoundingClientRect();
     const clientX = e.touches && e.touches.length ? e.touches[0].clientX : e.clientX;
-    const padX = 12, uw = Math.max(1, r.width - 2 * padX);
-    const x = clientX - r.left;
-    const t = Math.max(0, Math.min(trDur, ((x - padX) / uw) * trDur));
-    const xs = padX + (trStart / trDur) * uw, xe = padX + (trEnd / trDur) * uw;
+    const uw = Math.max(1, r.width - 2 * WPAD), x = clientX - r.left, span = viewSpan();
+    const t = Math.max(0, Math.min(trDur, trView.a + ((x - WPAD) / uw) * span));
+    const xs = WPAD + (trStart - trView.a) / span * uw, xe = WPAD + (trEnd - trView.a) / span * uw;
     return {x, t, xs, xe};
   };
   const onDown = e => {
@@ -5000,12 +5092,7 @@ function bindWaveform(){
     const {x, t, xs, xe} = posFromEvent(e);
     if (Math.abs(x - xs) <= 12 && Math.abs(x - xs) <= Math.abs(x - xe)) trDrag = "start";
     else if (Math.abs(x - xe) <= 12) trDrag = "end";
-    else {
-      trDrag = "seek";
-      trCurTime = t;
-      aud.currentTime = t;
-      drawWave();
-    }
+    else { trDrag = "seek"; seekTo(t); }
   };
   const onMove = e => {
     if (!trDur) return;
@@ -5024,9 +5111,7 @@ function bindWaveform(){
       trEnd = Math.min(trDur, Math.max(t, trStart + 0.2));
       updateTrimTimesUI();
     } else if (trDrag === "seek"){
-      trCurTime = t;
-      aud.currentTime = t;
-      drawWave();
+      trCurTime = t; aud.currentTime = t; drawWave();
     }
   };
   const onUp = () => { trDrag = null; };
@@ -5036,6 +5121,15 @@ function bindWaveform(){
   cv.addEventListener("touchstart", onDown, {passive: true});
   window.addEventListener("touchmove", onMove, {passive: false});
   window.addEventListener("touchend", onUp);
+  cv.addEventListener("wheel", e => {
+    if (!trDur) return;
+    e.preventDefault();
+    const {t} = posFromEvent(e);
+    if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)){
+      const d = (e.shiftKey ? e.deltaY : e.deltaX) / Math.max(1, cv.clientWidth) * viewSpan();
+      setView(trView.a + d, trView.b + d);
+    } else zoomAt(t, Math.exp(e.deltaY * (e.ctrlKey ? 0.01 : 0.0025)));
+  }, {passive: false});
   window.addEventListener("resize", () => { if (curTab === "audio") drawWave(); });
 
   aud.onerror = () => {
@@ -5059,16 +5153,13 @@ function bindWaveform(){
       aud.volume = Math.max(0, Math.min(1, vol));
       if (trCurTime >= trEnd - 0.02){
         if ($("#trLoop").checked){
-          aud.currentTime = trStart;
-          trCurTime = trStart;
+          aud.currentTime = trStart; trCurTime = trStart;
         } else {
-          aud.pause();
-          aud.currentTime = trStart;
-          trCurTime = trStart;
-          drawWave();
-          return;
+          aud.pause(); aud.currentTime = trStart; trCurTime = trStart; drawWave(); return;
         }
       }
+      if (trCurTime > trView.b || trCurTime < trView.a)              // la vue suit la lecture
+        setView(trCurTime - viewSpan() * 0.05, trCurTime + viewSpan() * 0.95);
       drawWave();
       trRaf = requestAnimationFrame(tick);
     };
@@ -5080,6 +5171,22 @@ function bindWaveform(){
     $("#trPlay").textContent = "▶ Écouter l'extrait";
     drawWave();
   };
+  // raccourcis : Espace, I / O, ← →, + / -, 0
+  document.addEventListener("keydown", e => {
+    if (curTab !== "audio" || !trDur || e.metaKey || e.ctrlKey || e.altKey) return;
+    const tg = e.target, tag = tg && tg.tagName;
+    if (tag === "INPUT" && !["checkbox", "radio", "range"].includes(tg.type) || tag === "TEXTAREA" || tag === "SELECT") return;
+    const k = e.key;
+    if (k === " "){ e.preventDefault(); $("#trPlay").click(); }
+    else if (k === "i" || k === "I"){ $("#trSetStart").click(); }
+    else if (k === "o" || k === "O"){ $("#trSetEnd").click(); }
+    else if (k === "ArrowLeft" || k === "ArrowRight"){
+      e.preventDefault(); seekTo(trCurTime + (k === "ArrowLeft" ? -1 : 1) * (e.shiftKey ? 0.1 : 1));
+    }
+    else if (k === "+" || k === "="){ zoomAt(trCurTime, 0.5); }
+    else if (k === "-" || k === "_"){ zoomAt(trCurTime, 2); }
+    else if (k === "0"){ setView(0, trDur); }
+  });
 }
 
 function stopTrimAudio(){
@@ -5121,6 +5228,7 @@ async function exportAudio(){
     wav_bits: parseInt($("#trWavBits").value, 10),
     fade_in: parseFloat($("#trFadeIn").value) || 0,
     fade_out: parseFloat($("#trFadeOut").value) || 0,
+    loudness: $("#trLoud").value,
     keep_meta: $("#trKeepMeta").checked,
     title: $("#trTagTitle").value,
     artist: $("#trTagArtist").value,
@@ -5394,6 +5502,8 @@ $$("[data-step]").forEach(b => {
     } else {
       trEnd = Math.min(trDur, Math.max(trEnd + d, trStart + 0.2));
     }
+    const h = which === "s" ? trStart : trEnd;
+    if (h < trView.a || h > trView.b) setView(h - viewSpan() / 2, h + viewSpan() / 2);
     updateTrimTimesUI();
   };
 });
@@ -5408,7 +5518,21 @@ $("#trEndInp").onchange = e => {
   updateTrimTimesUI();
 };
 $("#trOutName").oninput = () => { trNameEdited = true; };
-$("#trFadeIn").onchange = $("#trFadeOut").onchange = $("#trKeepMeta").onchange = $("#trBatch").onchange = applyTrimFmt;
+$("#trFadeIn").onchange = $("#trFadeOut").onchange = $("#trLoud").onchange = $("#trKeepMeta").onchange = $("#trBatch").onchange = applyTrimFmt;
+$("#trZoomIn").onclick = () => zoomAt(trCurTime >= trView.a && trCurTime <= trView.b ? trCurTime : (trView.a + trView.b) / 2, 0.5);
+$("#trZoomOut").onclick = () => zoomAt((trView.a + trView.b) / 2, 2);
+$("#trZoomAll").onclick = () => setView(0, trDur);
+$("#trZoomSel").onclick = () => { const m = (trEnd - trStart) * 0.06; setView(trStart - m, trEnd + m); };
+$("#trSilence").onclick = async () => {
+  if (!trTrack) return;
+  const b = $("#trSilence"), want = trTrack;
+  b.disabled = true; b.textContent = "Analyse…";
+  try{
+    const j = await (await fetch(`/api/silence?name=${enc(want)}`, {cache:"no-store"})).json();
+    if (j.ok && trTrack === want){ trStart = j.start; trEnd = j.end; trCurTime = trStart; $("#trAudio").currentTime = trStart; updateTrimTimesUI(); }
+  }catch(e){}
+  b.disabled = false; b.textContent = "✨ Retirer les silences";
+};
 $$('input[name="trDestMode"]').forEach(r => r.onchange = applyTrimFmt);
 $("#trCancel").onclick = () => post("/api/audio/cancel").then(() => refresh(true));
 $("#trExportBtn").onclick = exportAudio;
