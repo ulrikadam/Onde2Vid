@@ -95,12 +95,12 @@ LOGO_SVG = (
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".aac", ".alac", ".ogg", ".oga", ".opus", ".wma",
              ".aif", ".aiff", ".aifc", ".caf", ".mp2", ".ac3", ".ape", ".wv", ".mka", ".amr"}   # lus par FFmpeg
-STYLES = ["mandala", "synthwave", "warp", "circle", "retro", "mirror", "tunnel", "cubes", "aurora",
+STYLES = ["corridor", "cassette", "mandala", "synthwave", "warp", "circle", "retro", "mirror", "tunnel", "cubes", "aurora",
           "cqt", "bars", "waves", "spectrum", "scope"]
 MASK_STYLES = {"circle", "retro", "mirror", "cubes", "aurora",
-               "mandala", "synthwave", "warp", "cqt", "scope"}                   # colorés avec un schéma
-ROUND_STYLES = {"circle", "tunnel", "mandala", "synthwave", "warp"}   # jaquette ronde
-BEAT_STYLES = {"synthwave", "warp"}                              # vitesse qui suit les basses
+               "mandala", "synthwave", "warp", "cqt", "scope", "corridor", "cassette"}                   # colorés avec un schéma
+ROUND_STYLES = {"circle", "tunnel", "mandala", "synthwave", "warp", "corridor"}   # jaquette ronde
+BEAT_STYLES = {"synthwave", "warp", "corridor", "cassette"}                              # vitesse qui suit les basses
 PALETTES = ["intensity", "rainbow", "fire", "cool", "magma", "viridis", "plasma", "nebulae"]
 SCHEMES = {
     "neon":    ["#00e5ff", "#7a5cff", "#ff3df5"],
@@ -647,16 +647,18 @@ def compute_layout(mp3: Path, s: dict, W: int, H: int) -> dict:
             i = probe(cover)
             front = "square" if (i["w"] and i["h"] and i["w"] / i["h"] < 1.45) else None
 
+    if st == "cassette":
+        front = None                            # la jaquette devient l'étiquette de la cassette
     title = title_text(mp3, s) if (s["title"] and title_ok()) else ""
     sub = s["subtitle"].strip() if title_ok() else ""
-    text_top = st == "synthwave" or ((not rnd) and s["viz_pos"] != "top")
+    text_top = st in ("synthwave", "corridor", "cassette") or ((not rnd) and s["viz_pos"] != "top")
     texts, band = text_items(title, sub, W, H, U, text_top)
     vh, vy = viz_geometry(s, H, U)
     L = dict(W=W, H=H, U=U, s=s, style=st, cover=cover, csrc=csrc, bg_img=bg_img, front=front,
              texts=texts, band=band, text_top=text_top, vh=vh, vy=vy)
 
     top, bottom = 0, H
-    if not rnd and vh < H:
+    if not rnd and vh < H and st != "cassette":
         if s["viz_pos"] == "bottom":
             bottom = vy
         elif s["viz_pos"] == "top":
@@ -686,8 +688,17 @@ def compute_layout(mp3: Path, s: dict, W: int, H: int) -> dict:
             hz = even(H * 0.62)
             rc = max(U * 0.05, min(U * (0.1 + 0.12 * t), (hz - top - U * 0.04) / 2))
             L.update(hz=hz, rc=int(rc), fy=hz - int(rc) - int(U * 0.012))
+        elif st == "corridor":                  # la jaquette au bout du couloir
+            hz = even(H * 0.42)
+            rc = max(U * 0.04, min(U * (0.05 + 0.09 * t), (hz - top - U * 0.02)))
+            L.update(hz=hz, rc=int(rc), fy=hz)
         else:
             L["rc"] = int(min(room * 0.6, U * (0.1 + 0.14 * t)))
+    elif st == "cassette":
+        t = (s["viz_size"] - 15) / 85
+        k = (0.72 + 0.2 * t) if H > W else (0.4 + 0.45 * t)       # en vertical : presque toute la largeur
+        L["cas_w"] = even(min(W * k, W * 0.86, (bottom - top - U * 0.05) / 0.63 / 1.15))
+        L["rc"] = 0
     else:
         bh = even(max(U * 0.2, min(H * 0.72, bottom - top - U * 0.06)))
         L["fbox"] = (even(W * 0.9), bh)
@@ -1741,6 +1752,330 @@ def layer_scope(g: Graph, L: dict, s: dict, fps: int):
     return colorize(g, L, tr, W, vh, grad), 0, L["vy"]
 
 
+CORRIDOR_NP = 16              # positions d'avancée pré-calculées (une période entre deux cubes)
+
+
+def corridor_maps(RW: int, RH: int, NP: int, NB: int, SH: int, cy: float):
+    """Couloir de cubes en perspective, NP positions d'avancée empilées verticalement.
+    Cartes (16 bits) : bande du spectre et seuil de remplissage de chaque face, ombrage
+    des faces, arêtes des cubes + sol quadrillé. Calcul d'une moitié, l'autre en miroir."""
+    e, Hb, xin, xout, dep, P, z0 = 1.3, 1.0, 1.05, 2.0, 0.95, 1.7, 1.1
+    zfar, fz = 60.0, 22.0
+    f = max(RW, RH) * 0.5
+    cx = RW / 2
+    lzn, lzf = math.log(1.6), math.log(40.0)
+    top_row = int(0.04 * (SH - 1))
+
+    def build():
+        n = RW * RH * NP
+        xm, ym = array("H", [BAD]) * n, array("H", [BAD]) * n
+        sh, wi = array("H", [0]) * n, array("H", [0]) * n
+        exp, log, floor = math.exp, math.log, math.floor
+        for p in range(NP):
+            ph = p / NP * P
+            for v in range(RH):
+                py = (cy - v - 0.5) / f
+                if py > -1e-4:
+                    continue                                   # ciel
+                base = (p * RH + v) * RW
+                tf = e / -py
+                t_top = (e - Hb) / -py
+                for u in range(RW // 2, RW):
+                    X = (u + 0.5 - cx) / f
+                    hit = None
+                    tlim = min(tf, zfar)
+                    if X > 1e-6:
+                        t_in, t_out = xin / X, xout / X
+                        if t_in < tlim:
+                            k = max(0, floor((t_in - z0 + ph - dep) / P))
+                            k1 = floor((min(t_out, tlim) - z0 + ph) / P)
+                            while k <= k1:
+                                zs = z0 + k * P - ph
+                                ze = zs + dep
+                                k += 1
+                                if ze < 0.3:
+                                    continue
+                                if zs <= t_in <= ze:
+                                    y = e + py * t_in
+                                    if 0 <= y <= Hb:
+                                        fzp, fyp = t_in * t_in / (xin * f), t_in / f
+                                        d = min((t_in - zs) / fzp, (ze - t_in) / fzp, y / fyp, (Hb - y) / fyp)
+                                        hit = (t_in, zs, y, 0.42, d)
+                                        break
+                                if t_in < zs <= t_out:
+                                    y = e + py * zs
+                                    if 0 <= y <= Hb:
+                                        x, fp = X * zs, zs / f
+                                        d = min((x - xin) / fp, (xout - x) / fp, y / fp, (Hb - y) / fp)
+                                        hit = (zs, zs, y, 0.7, d)
+                                        break
+                                if max(t_in, zs) <= t_top <= min(t_out, ze):
+                                    x, fxp, fzp = X * t_top, t_top / f, t_top * t_top / ((e - Hb) * f)
+                                    d = min((x - xin) / fxp, (xout - x) / fxp, (t_top - zs) / fzp, (ze - t_top) / fzp)
+                                    hit = (t_top, zs, -1.0, 0.55, d)
+                                    break
+                    i, j = base + u, base + RW - 1 - u
+                    if hit:
+                        t, zs, y, shade, d = hit
+                        fog = exp(-t / fz)
+                        kc = max(1.6, zs + dep / 2)
+                        col = int(min(1.0, max(0.0, (log(kc) - lzn) / (lzf - lzn))) * (NB - 1) + 0.5)
+                        row = top_row if y < 0 else int((1 - y / Hb) * (SH - 1) + 0.5)
+                        edge = min(1.0, max(0.0, 1.4 - d))
+                        s_v, w_v = int(255 * shade * fog) * 257, int((30 + 225 * edge) * fog) * 257
+                        xm[i] = xm[j] = col
+                        ym[i] = ym[j] = row
+                        sh[i] = sh[j] = s_v
+                        wi[i] = wi[j] = w_v
+                    elif tf < zfar:                             # sol quadrillé qui défile
+                        x, fog = X * tf, exp(-tf / fz)
+                        a = _lines((tf + ph) / (P / 2), tf * tf / (e * f) / (P / 2), 0.05)
+                        b = _lines(x / 0.35, tf / f / 0.35, 0.06)
+                        wi[i] = wi[j] = int(150 * fog * max(a, b)) * 257
+        return [xm, ym, sh, wi]
+    return cached_maps("couloir", (NP, NB, SH, round(cy, 1), 2), RW, RH * NP, build)
+
+
+def corridor_colors(RW: int, RH: int, cy: float):
+    """Couleur selon l'éloignement : loin (centre) → dernière couleur, près (bords) → première."""
+    def build():
+        xc, yc = array("H"), array("H", [0]) * (RW * RH)
+        rmax = math.hypot(RW / 2, max(cy, RH - cy))
+        for v in range(RH):
+            for u in range(RW):
+                r = math.hypot(u + 0.5 - RW / 2, (v + 0.5 - cy) * 1.6)
+                xc.append(int((1 - min(1.0, r / rmax)) * 255))
+        return [xc, yc]
+    return cached_maps("couloir_col", (round(cy, 1),), RW, RH, build)
+
+
+def layer_corridor(g: Graph, L: dict, s: dict, fps: int):
+    """Couloir 3D : on avance entre deux rangées de cubes qui se remplissent de lumière avec
+    la musique (près = basses, loin = aigus) ; l'avancée accélère sur les basses."""
+    W, H = L["W"], L["H"]
+    sc = min(1.0, 640 / max(W, H))
+    RW, RH = even(W * sc), even(H * sc)
+    NP, NB, SH = CORRIDOR_NP, 24, 128
+    cy = L["hz"] * sc
+    xm, ym, shd, wir = corridor_maps(RW, RH, NP, NB, SH, cy)
+    stops, _ = scheme_stops(s, L["cover"])
+    xc, yc = corridor_colors(RW, RH, cy)
+    col = map_color_image(stops, False, 256, 2, xc, yc)
+    pos = beat_positions(L, NP / (0.5 * fps), 1.8)
+    ys = [(int(p) % NP) * RH for p in pos]
+    cmds = frame_cmds(fps, ("crop@ca", "y", ys), ("crop@cb", "y", ys), ("crop@cc", "y", ys),
+                      ("crop@cd", "y", ys), ("color@cg", "c", flash_values(L, 0.72)))
+    a, b, c, d = g.still(xm), g.still(ym), g.still(shd), g.still(wir)
+    src, ma, mb, mc, md, fill, sf, lit = (g.label() for _ in range(8))
+    crop = f"w={RW}:h={RH}:x=0:y=0"
+    g.add(f"[{a}]sendcmd=f='{ffpath(cmds)}',crop@ca={crop}[{ma}];[{b}]crop@cb={crop}[{mb}];"
+          f"[{c}]crop@cc={crop},format=gray[{mc}];[{d}]crop@cd={crop},format=gray[{md}]")
+    loud = dict(s, sensitivity=s["sensitivity"] + 10)              # des cubes bien remplis
+    g.add(f"[0:a]{cqt_src(NB, SH, loud, fps, 0.8, tilt=0.35)}[{src}]")
+    g.add(f"[{src}][{ma}][{mb}]remap=format=gray[{fill}];[{fill}]{UNFILL}[{fill}u];"
+          f"[{fill}u][{mc}]blend=all_mode=multiply[{sf}];[{sf}][{md}]blend=all_mode=lighten[{lit}]")
+    scene = colorize(g, dict(L, U=min(RW, RH)), flash(g, lit, RW, RH, fps, "cg"), RW, RH, col)
+    rc = L["rc"] * sc
+    bd, al, bk, out = g.label(), g.still(synth_backdrop(RW, RH, int(cy), cy, rc), "gray"), g.label(), g.label()
+    g.add(f"color=c=0x0b0420:s={RW}x{RH}:r={fps},format=yuva420p[{bd}];"
+          f"[{bd}][{al}]alphamerge=shortest=1[{bk}];[{bk}][{scene}]overlay=shortest=1:format=auto[{out}]")
+    if (RW, RH) != (W, H):
+        up = g.label()
+        g.add(f"[{out}]scale={W}:{H}:flags=bicubic[{up}]")
+        out = up
+    return out, 0, 0
+
+
+def write_ppm(path: Path, w: int, h: int, data: bytes) -> Path:
+    part = path.with_name(path.stem + ".part" + path.suffix)
+    with open(part, "wb") as fh:
+        fh.write(b"P6\n%d %d\n255\n" % (w, h))
+        fh.write(data)
+    os.replace(part, path)
+    return path
+
+
+def _rr(x: float, y: float, x0: float, y0: float, x1: float, y1: float, r: float) -> float:
+    """Distance signée à un rectangle arrondi (négative à l'intérieur)."""
+    dx = max(x0 + r - x, 0.0, x - (x1 - r))
+    dy = max(y0 + r - y, 0.0, y - (y1 - r))
+    if dx > 0 and dy > 0:
+        return math.hypot(dx, dy) - r
+    return max(dx, dy) - r if (dx or dy) else max(x0 - x, x - x1, y0 - y, y - y1)
+
+
+def _hex_rgb(c: str) -> tuple[int, int, int]:
+    c = c.lstrip("#")
+    return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+
+
+def cassette_art(bw: int, bh: int, CW: int, CH: int, edge: str):
+    """Dessin de la cassette (coque, fenêtre, bobines de bande, vis) dans une toile CW×CH.
+    Renvoie les images et la géométrie (étiquette, centres des moyeux, taille d'un moyeu)."""
+    ox, oy = (CW - bw) / 2, (CH - bh) / 2
+    B = lambda u, v: (ox + u * bw, oy + v * bh)                     # coordonnées dans la toile
+    lab = (*B(0.055, 0.07), *B(0.945, 0.71))
+    win = (*B(0.25, 0.335), *B(0.75, 0.585))
+    hubs = [B(0.345, 0.46), B(0.655, 0.46)]
+    rh = bw * 0.058
+    spool = [bw * 0.118, bw * 0.082]
+    trap_t, xl_t, xr_t = oy + 0.775 * bh, ox + 0.215 * bw, ox + 0.785 * bw
+    xl_b, xr_b = ox + 0.175 * bw, ox + 0.825 * bw
+    holes = [(*B(0.29, 0.885), bw * 0.024), (*B(0.71, 0.885), bw * 0.024),
+             (*B(0.43, 0.9), bw * 0.013), (*B(0.57, 0.9), bw * 0.013)]
+    screws = [(*B(0.035, 0.06), bw * 0.016), (*B(0.965, 0.06), bw * 0.016),
+              (*B(0.035, 0.94), bw * 0.016), (*B(0.965, 0.94), bw * 0.016), (*B(0.5, 0.86), bw * 0.016)]
+    w = max(1.3, bw * 0.0042)
+    er, eg, eb = _hex_rgb(edge)
+    key = (bw, bh, CW, CH, edge, 1)
+
+    def paths():
+        h = short_hash("k7", *key)
+        return [TMP / f"k7_{h}_{n}" for n in ("rgb.ppm", "a.pgm", "lab.pgm", "neon.pgm", "back.ppm", "reel.pgm")]
+    out = paths()
+    RS = even(2 * rh + 4)
+    geo = dict(label=tuple(int(v) for v in lab), hubs=[(int(x - RS / 2), int(y - RS / 2)) for x, y in hubs], RS=RS)
+    if all(p.exists() for p in out):
+        return out, geo
+    rgb, alpha, lmask, neon, back = (bytearray(CW * CH * k) for k in (3, 1, 1, 1, 3))
+    rb = bw * 0.04
+    for y in range(CH):
+        py = y + 0.5
+        for x in range(CW):
+            px = x + 0.5
+            db = _rr(px, py, ox, oy, ox + bw, oy + bh, rb)
+            a = min(1.0, max(0.0, 0.5 - db))
+            if a <= 0:
+                continue
+            i = y * CW + x
+            alpha[i] = int(255 * a)
+            g = 34 + 12 * (1 - (py - oy) / bh) + (14 if db > -bw * 0.012 else 0)
+            col = (g * 0.82, g * 0.7, g * 1.25)
+            dl = _rr(px, py, *lab, bw * 0.02)
+            dw = _rr(px, py, *win, bw * 0.035)
+            ring = abs(db + w * 1.6) < w or abs(dl) < w * 0.8 or abs(dw) < w * 0.8
+            if dl < 0 and dw >= 0:
+                lmask[i] = int(255 * min(1.0, max(0.0, -dl)) * min(1.0, max(0.0, dw)))
+            if dw < 0:                                           # fenêtre : bandes enroulées
+                col = (12, 10, 18)
+                for (hx, hy), sr in zip(hubs, spool):
+                    r = math.hypot(px - hx, py - hy)
+                    if r < sr:
+                        tone = 0.85 + 0.15 * math.sin(r * 1.7)
+                        col = (70 * tone, 44 * tone, 28 * tone) if r > rh * 0.98 else (12, 10, 18)
+            if py >= trap_t:                                     # bas de la cassette (trapèze)
+                f = (py - trap_t) / max(1.0, oy + bh - trap_t)
+                xl, xr = xl_t + (xl_b - xl_t) * f, xr_t + (xr_b - xr_t) * f
+                if xl <= px <= xr:
+                    col = (g * 0.95, g * 0.85, g * 1.4)
+                if abs(py - trap_t) < w * 0.8 and xl_t <= px <= xr_t:
+                    ring = True
+                if abs(px - xl) < w * 0.8 * 1.02 or abs(px - xr) < w * 0.8 * 1.02:
+                    ring = True
+                for hx, hy, hr in holes:
+                    if math.hypot(px - hx, py - hy) < hr:
+                        col = (5, 5, 9)
+            for sx, sy, sr in screws:
+                r = math.hypot(px - sx, py - sy)
+                if r < sr:
+                    col = (40, 40, 48) if abs((px - sx) - (py - sy)) < sr * 0.22 else (130, 130, 145)
+            if ring:
+                neon[i] = 255
+            j = 3 * i
+            rgb[j:j + 3] = bytes(int(min(255, c)) for c in col)
+            edge_b = abs(db + w * 1.6) < w * 1.4
+            back[j:j + 3] = bytes((int(er * 0.55), int(eg * 0.55), int(eb * 0.55)) if edge_b else (14, 10, 22))
+    reel = bytearray(RS * RS)
+    for y in range(RS):
+        for x in range(RS):
+            dx, dy = x + 0.5 - RS / 2, y + 0.5 - RS / 2
+            r = math.hypot(dx, dy) / rh
+            ang = math.degrees(math.atan2(dy, dx)) % 60
+            on = 0.6 <= r <= 1.0 or (0.36 <= r < 0.6 and min(ang, 60 - ang) < 7)
+            reel[y * RS + x] = 235 if on else 0
+    write_ppm(out[0], CW, CH, bytes(rgb))
+    for p, d in ((out[1], alpha), (out[2], lmask), (out[3], neon)):
+        write_pgm8(p, CW, CH, bytes(d))
+    write_ppm(out[4], CW, CH, bytes(back))
+    write_pgm8(out[5], RS, RS, bytes(reel))
+    return out, geo
+
+
+def k7_persp(cw: int, ch: int, zoff: float, i0: int, fps: int) -> str:
+    """Rotation 3D lente (va-et-vient autour de l'axe vertical, légère inclinaison) d'un plan
+    situé à la profondeur zoff, en perspective."""
+    D, ph = 2.6 * cw, -0.24
+    T = f"(0.32*sin({2 * math.pi / (fps * 9):.6f}*(in+{i0})))"
+    cp, sp = math.cos(ph), math.sin(ph)
+    pts = []
+    for x, y in ((-cw / 2, -ch / 2), (cw / 2, -ch / 2), (-cw / 2, ch / 2), (cw / 2, ch / 2)):
+        xr = f"({x:.1f}*cos{T}+({zoff:.1f})*sin{T})"
+        zr = f"(({-x:.1f})*sin{T}+({zoff:.1f})*cos{T})"
+        yp = f"(({y * cp:.2f})-{zr}*({sp:.4f}))"
+        zp = f"(({y * sp:.2f})+{zr}*({cp:.4f}))"
+        pts.append((f"{cw / 2:.1f}+{xr}*{D:.1f}/({D:.1f}+{zp})", f"{ch / 2:.1f}+{yp}*{D:.1f}/({D:.1f}+{zp})"))
+    return "perspective=" + ":".join(f"x{k}='{px}':y{k}='{py}'" for k, (px, py) in enumerate(pts)) + \
+           ":sense=destination:eval=frame"
+
+
+def layer_cassette(g: Graph, L: dict, s: dict, fps: int):
+    """Cassette audio en 3D : la jaquette en étiquette, des bobines qui tournent plus vite sur les
+    basses, des contours néon qui s'allument, un lent va-et-vient en 3D et un battement sur les basses."""
+    BWf = L["cas_w"]
+    ks = min(1.0, 700 / BWf)
+    bw = even(BWf * ks)
+    bh = even(bw * 0.63)
+    CW, CH = even(bw * 1.3), even(bh * 1.55)
+    stops, _ = scheme_stops(s, L["cover"])
+    (rgb, alp, lmask, neon, back, reel), geo = cassette_art(bw, bh, CW, CH, stops[len(stops) // 2])
+    lx0, ly0, lx1, ly1 = geo["label"]
+    LW, LH = even(lx1 - lx0 + 2), even(ly1 - ly0 + 2)
+    if L["cover"]:
+        lab_in = ["-i", L["cover"]]
+        lab_v = f"[2:v]scale={LW}:{LH}:force_original_aspect_ratio=increase,crop={LW}:{LH}"
+    else:
+        lab_in = ["-i", grad_image(stops, LW, LH, False)]
+        lab_v = "[2:v]null"
+    base = TMP / f"k7base_{short_hash(str(rgb), file_key(L['cover']) if L['cover'] else '-', LW, LH)}.png"
+    make_asset(base, "-i", rgb, "-i", alp, *lab_in, "-i", lmask, "-filter_complex",
+               f"[0:v][1:v]alphamerge[b];{lab_v},format=rgba,pad={CW}:{CH}:{lx0}:{ly0}:color=black@0[c];"
+               f"[c][3:v]alphamerge[l];[b][l]overlay=format=auto", "-frames:v", "1", what="Cassette")
+    reel_png = TMP / f"k7reel_{short_hash(str(reel))}.png"
+    make_asset(reel_png, "-f", "lavfi", "-i", f"color=c=0xf2f0f6:s={geo['RS']}x{geo['RS']}:d=1", "-i", reel,
+               "-filter_complex", "[0:v]format=rgba[c];[c][1:v]alphamerge", "-frames:v", "1", what="Cassette")
+    # bobines (vitesse qui suit les basses), battement (zoom), contours qui s'allument
+    ang = [f"{(p % (math.pi / 3)):.4f}" for p in beat_positions(L, 2 * math.pi / (2.4 * fps), 2.2)]
+    pulse, env = s["pulse"] / 100.0, L["env"]
+    zw, zh, zx, zy = [], [], [], []
+    for j in range(L["nfr"]):
+        z = 1 + 0.16 * pulse * (env[j] if j < len(env) else 0.0)
+        w_, h_ = even(CW / z), even(CH / z)
+        zw.append(w_); zh.append(h_); zx.append((CW - w_) // 2); zy.append((CH - h_) // 2)
+    cmds = frame_cmds(fps, ("rotate@ka", "a", ang), ("rotate@kb", "a", ang), ("crop@kz", "w", zw),
+                      ("crop@kz", "h", zh), ("crop@kz", "x", zx), ("crop@kz", "y", zy),
+                      ("color@kg", "c", flash_values(L, 0.5)))
+    bs, rl, nm = g.still(base, "rgba"), g.still(reel_png, "rgba"), g.still(neon, "gray")
+    r1, r2, ra, rb, k1, k2, fr, fp, bp, bk, cas, z = (g.label() for _ in range(12))
+    (h1x, h1y), (h2x, h2y) = geo["hubs"]
+    g.add(f"[{bs}]sendcmd=f='{ffpath(cmds)}'[{k1}x];[{rl}]split[{r1}][{r2}];"
+          f"[{r1}]rotate@ka=a=0:c=none:ow=iw:oh=ih[{ra}];[{r2}]rotate@kb=a=0:c=none:ow=iw:oh=ih[{rb}];"
+          f"[{k1}x][{ra}]overlay={h1x}:{h1y}:format=auto[{k1}];[{k1}][{rb}]overlay={h2x}:{h2y}:format=auto[{k2}]")
+    grad = grad_image(stops, CW, CH, False)
+    ne = colorize(g, dict(L, U=min(CW, CH) * 0.55), flash(g, nm, CW, CH, fps, "kg"), CW, CH, grad)
+    i0 = L["i0"]
+    dx, dy = max(2, round(bw * 0.012)), max(3, round(bw * 0.022))     # épaisseur de la coque
+    g.add(f"[{k2}][{ne}]overlay=format=auto[{fr}];[{fr}]{k7_persp(CW, CH, 0.0, i0, fps)},split[{fp}][{bp}];"
+          f"[{bp}]lutrgb=r=34:g=22:b=58,pad={CW + dx}:{CH + dy}:{dx}:{dy}:color=black@0,crop={CW}:{CH}:0:0[{bk}];"
+          f"[{bk}][{fp}]overlay=format=auto[{cas}];"
+          f"[{cas}]crop@kz=w={CW}:h={CH}:x=0:y=0,scale={CW}:{CH}:flags=bicubic[{z}]")
+    out = z
+    CWf, CHf = even(CW / ks), even(CH / ks)
+    if ks < 1.0:
+        out = g.label()
+        g.add(f"[{z}]scale={CWf}:{CHf}:flags=bicubic[{out}]")
+    return out, L["fx"] - CWf // 2, L["fy"] - CHf // 2
+
+
 def layer_synthwave(g: Graph, L: dict, s: dict, fps: int):
     sc = min(1.0, 1280 / L["W"])                            # calcul allégé, puis agrandi
     W, H, U = even(L["W"] * sc), even(L["H"] * sc), L["U"] * sc
@@ -1826,6 +2161,10 @@ def style_layer(g: Graph, L: dict, s: dict, fps: int, keyed: bool):
         return layer_warp(g, L, s, fps)
     if st == "synthwave":
         return layer_synthwave(g, L, s, fps)
+    if st == "corridor":
+        return layer_corridor(g, L, s, fps)
+    if st == "cassette":
+        return layer_cassette(g, L, s, fps)
     if st == "cqt":
         return layer_piano(g, L, s, fps)
     if st == "scope":
@@ -3444,9 +3783,11 @@ const TOKEN = "__TOKEN__";
 const ticks = (n, r, lens) => Array.from({length:n},(_,i)=>{const a=i/n*2*Math.PI, l=lens[i%lens.length];
   return `<line x1="${(30+Math.sin(a)*r).toFixed(1)}" y1="${(17-Math.cos(a)*r).toFixed(1)}" x2="${(30+Math.sin(a)*(r+l)).toFixed(1)}" y2="${(17-Math.cos(a)*(r+l)).toFixed(1)}"/>`;}).join("");
 const STYLES = {
-  mandala:["Mandala",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff3df5"/><stop offset="1" stop-color="#00e5ff"/></linearGradient></defs><g fill="#ff3df5" fill-opacity=".15" stroke="url(#gd)" stroke-width="1.1">'+Array.from({length:8},(_,i)=>`<ellipse cx="30" cy="8" rx="3.4" ry="7.2" transform="rotate(${i*45} 30 17)"/>`).join("")+'</g><g fill="none" stroke="#00e5ff" stroke-width=".9" opacity=".8">'+Array.from({length:8},(_,i)=>`<ellipse cx="30" cy="11" rx="2.2" ry="4.4" transform="rotate(${i*45+22.5} 30 17)"/>`).join("")+'</g><circle cx="30" cy="17" r="4" fill="currentColor"/></svg>',1],
-  synthwave:["Horizon néon",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gs" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd23d"/><stop offset="1" stop-color="#ff3df5"/></linearGradient></defs><circle cx="30" cy="11.5" r="7" fill="url(#gs)"/><path d="M1 19 L5 15 L8 16.5 L12 11 L16 15 L21 18.5 M39 18.5 L44 15 L48 11.5 L52 16 L55 14 L59 19" fill="none" stroke="#b33dff" stroke-width="1.1"/><g stroke="#00e5ff" stroke-width=".8"><path d="M0 19.5 H60" stroke-width="1.1"/><path d="M0 21.5 H60 M0 24.5 H60 M0 28.5 H60 M0 33.5 H60" opacity=".75"/>'+[-5,-3,-1.6,-.5,.5,1.6,3,5].map(d=>`<path d="M${(30+d*3).toFixed(1)} 19.5 L${(30+d*12).toFixed(1)} 34" opacity=".75"/>`).join("")+'</g></svg>',1],
-  warp:["Hyperespace",'<svg viewBox="0 0 60 34" stroke-linecap="round">'+Array.from({length:18},(_,i)=>{const a=i/18*2*Math.PI+.3, r1=6+(i%3)*2.2, r2=r1+4+(i%4)*2.6; return `<line x1="${(30+Math.cos(a)*r1).toFixed(1)}" y1="${(17+Math.sin(a)*r1*.8).toFixed(1)}" x2="${(30+Math.cos(a)*r2).toFixed(1)}" y2="${(17+Math.sin(a)*r2*.8).toFixed(1)}" stroke="${["#00e5ff","#7a5cff","#ff3df5"][i%3]}" stroke-width="1.2"/>`;}).join("")+'<circle cx="30" cy="17" r="3.8" fill="currentColor"/></svg>',1],
+  corridor:["Couloir 3D",'<svg viewBox="0 0 60 34" fill="none" stroke-width="1"><path d="M30 13 L30 13" stroke="#fff"/><g stroke="#00e5ff"><path d="M2 32 L24 16 M58 32 L36 16" opacity=".6"/></g><g stroke="#b06bff"><rect x="3" y="15" width="9" height="9"/><rect x="13" y="17" width="6" height="6"/><rect x="20" y="18.5" width="4" height="4"/><rect x="48" y="15" width="9" height="9"/><rect x="41" y="17" width="6" height="6"/><rect x="36" y="18.5" width="4" height="4"/></g><g fill="#ff3df5" stroke="none"><rect x="3.5" y="20" width="8" height="3.5"/><rect x="48.5" y="18" width="8" height="5.5"/><rect x="13.5" y="20.5" width="5" height="2"/></g><circle cx="30" cy="16" r="3" fill="#fff" stroke="none"/></svg>',1],
+  cassette:["Cassette K7",'<svg viewBox="0 0 60 34" fill="none"><rect x="9" y="4" width="42" height="26" rx="2.5" stroke="#b06bff" stroke-width="1.2"/><rect x="12" y="7" width="36" height="13" rx="1" fill="#ff3df5" opacity=".35"/><rect x="20" y="10" width="20" height="7" rx="2" fill="#0b0420" stroke="#00e5ff" stroke-width=".8"/><circle cx="24.5" cy="13.5" r="2.2" stroke="#fff" stroke-width=".9"/><circle cx="35.5" cy="13.5" r="2.2" stroke="#fff" stroke-width=".9"/><path d="M19 30 L21 23 H39 L41 30" stroke="#b06bff" stroke-width=".9"/></svg>',1],
+  mandala:["Mandala",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff3df5"/><stop offset="1" stop-color="#00e5ff"/></linearGradient></defs><g fill="#ff3df5" fill-opacity=".15" stroke="url(#gd)" stroke-width="1.1">'+Array.from({length:8},(_,i)=>`<ellipse cx="30" cy="8" rx="3.4" ry="7.2" transform="rotate(${i*45} 30 17)"/>`).join("")+'</g><g fill="none" stroke="#00e5ff" stroke-width=".9" opacity=".8">'+Array.from({length:8},(_,i)=>`<ellipse cx="30" cy="11" rx="2.2" ry="4.4" transform="rotate(${i*45+22.5} 30 17)"/>`).join("")+'</g><circle cx="30" cy="17" r="4" fill="currentColor"/></svg>',0],
+  synthwave:["Horizon néon",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gs" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd23d"/><stop offset="1" stop-color="#ff3df5"/></linearGradient></defs><circle cx="30" cy="11.5" r="7" fill="url(#gs)"/><path d="M1 19 L5 15 L8 16.5 L12 11 L16 15 L21 18.5 M39 18.5 L44 15 L48 11.5 L52 16 L55 14 L59 19" fill="none" stroke="#b33dff" stroke-width="1.1"/><g stroke="#00e5ff" stroke-width=".8"><path d="M0 19.5 H60" stroke-width="1.1"/><path d="M0 21.5 H60 M0 24.5 H60 M0 28.5 H60 M0 33.5 H60" opacity=".75"/>'+[-5,-3,-1.6,-.5,.5,1.6,3,5].map(d=>`<path d="M${(30+d*3).toFixed(1)} 19.5 L${(30+d*12).toFixed(1)} 34" opacity=".75"/>`).join("")+'</g></svg>',0],
+  warp:["Hyperespace",'<svg viewBox="0 0 60 34" stroke-linecap="round">'+Array.from({length:18},(_,i)=>{const a=i/18*2*Math.PI+.3, r1=6+(i%3)*2.2, r2=r1+4+(i%4)*2.6; return `<line x1="${(30+Math.cos(a)*r1).toFixed(1)}" y1="${(17+Math.sin(a)*r1*.8).toFixed(1)}" x2="${(30+Math.cos(a)*r2).toFixed(1)}" y2="${(17+Math.sin(a)*r2*.8).toFixed(1)}" stroke="${["#00e5ff","#7a5cff","#ff3df5"][i%3]}" stroke-width="1.2"/>`;}).join("")+'<circle cx="30" cy="17" r="3.8" fill="currentColor"/></svg>',0],
   circle:["Cercle",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gc" x1="0" x2="1"><stop offset="0" stop-color="#00e5ff"/><stop offset="1" stop-color="#ff3df5"/></linearGradient></defs><g stroke="url(#gc)" stroke-width="2" stroke-linecap="round">'+ticks(18,8,[6,3,5,2,7,4])+'</g><circle cx="30" cy="17" r="6" fill="currentColor" opacity=".8"/></svg>',],
   retro:["Rétro LED",'<svg viewBox="0 0 60 34">'+[5,8,6,9,4,7,3,6].map((n,i)=>Array.from({length:n},(_,j)=>`<rect x="${4+i*6.8}" y="${30-j*3.3}" width="5" height="2.4" fill="${j>6?"#ff3d3d":j>4?"#ffd23d":"#22e05a"}"/>`).join("")).join("")+'</svg>',],
   mirror:["Miroir",'<svg viewBox="0 0 60 34"><defs><linearGradient id="gm" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#ff3d00"/><stop offset="1" stop-color="#ffe14d"/></linearGradient></defs>'+[3,5,7,10,13,10,7,5,3].map((h,i)=>`<rect x="${4+i*6}" y="${21-h}" width="4.4" height="${h}" fill="url(#gm)"/><rect x="${4+i*6}" y="22" width="4.4" height="${h*0.5}" fill="url(#gm)" opacity=".4"/>`).join("")+'</svg>',],
@@ -3459,8 +3800,9 @@ const STYLES = {
   spectrum:["Spectrogramme",'<svg viewBox="0 0 60 34"><defs><linearGradient id="g2" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#2a0a5e"/><stop offset=".5" stop-color="#e0407a"/><stop offset="1" stop-color="#ffe08a"/></linearGradient></defs>'+Array.from({length:14},(_,i)=>`<rect x="${2+i*4}" y="${4+((i*7)%9)}" width="3.6" height="${28-((i*7)%9)}" fill="url(#g2)" opacity="${.45+((i*3)%5)/9}"/>`).join("")+'</svg>'],
   scope:["Oscilloscope",'<svg viewBox="0 0 60 34"><path d="M30 4 C44 4 44 30 30 30 C16 30 16 4 30 4 Z M22 10 L38 24 M38 10 L22 24" fill="none" stroke="currentColor" stroke-width="1.8" opacity=".85"/></svg>']
 };
-const MASK = ["circle","retro","mirror","cubes","aurora","mandala","synthwave","warp","cqt","scope"],
-      ROUND = ["circle","tunnel","mandala","synthwave","warp"], CQT = ["circle","retro","mirror","cubes","mandala","synthwave","cqt","scope"];
+const MASK = ["circle","retro","mirror","cubes","aurora","mandala","synthwave","warp","cqt","scope","corridor","cassette"],
+      ROUND = ["circle","tunnel","mandala","synthwave","warp","corridor"],
+      CQT = ["circle","retro","mirror","cubes","mandala","synthwave","cqt","scope","corridor"];
 let S = null, settings = null, checked = new Set(), seen = new Set(), selected = null, saveT = null, lastImgs = "", cvName = null;
 let globalSet = null, tracks = {}, pendingSave = null;   // réglages communs / propres à certains morceaux
 let order = [], mixOn = false;                           // une seule vidéo : ordre des morceaux
@@ -3527,15 +3869,15 @@ function applySettings(){
   $("#o-sens").textContent = settings.sensitivity + " %";
   $("#o-pulse").textContent = settings.pulse ? settings.pulse + " %" : "Aucune";
   $("#o-neon").textContent = settings.neon ? settings.neon + " %" : "Aucun";
-  $("#l-size").textContent = !rnd ? "Taille" : sts.every(x => x === "synthwave") ? "Taille du soleil"
-                            : sts.every(x => ["synthwave","warp"].includes(x)) ? "Taille de la jaquette" : "Taille du cercle";
+  $("#l-size").textContent = !rnd ? (sts.every(x => x === "cassette") ? "Taille de la cassette" : "Taille") : sts.every(x => x === "synthwave") ? "Taille du soleil"
+                            : sts.every(x => ["synthwave","warp","corridor"].includes(x)) ? "Taille de la jaquette" : "Taille du cercle";
   const solid = ["solid","duo"].includes(settings.colors);
   $("#r-scheme").classList.toggle("hide", !mask);
   $("#r-color").classList.toggle("hide", !(sts.some(x => ["waves","bars"].includes(x)) || (mask && solid)));
   $("#color2").hidden = !(mask && settings.colors === "duo");
   $("#r-palette").classList.toggle("hide", !sts.some(x => ["spectrum","tunnel"].includes(x)));
   $("#r-sens").classList.toggle("hide", !sts.some(x => CQT.includes(x)));
-  $("#r-pos").classList.toggle("hide", rnd || settings.viz_size >= 100);
+  $("#r-pos").classList.toggle("hide", rnd || settings.viz_size >= 100 || sts.every(x => x === "cassette"));
   $("#r-effect").classList.toggle("hide", img === "__none__");
   $("#r-bg").classList.toggle("hide", img !== "__none__" && img !== "__auto__");
   $("#r-bg label").textContent = img === "__auto__" ? "Fond si pas d'image" : "Couleur de fond";
