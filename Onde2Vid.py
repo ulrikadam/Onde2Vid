@@ -4432,10 +4432,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 </div>
 
 <div class="action" id="audioAction" hidden>
-  <div class="opts">
-    <label class="check"><input type="checkbox" id="trOverwrite"><span>Remplacer si le fichier existe déjà dans output/</span></label>
-    <label class="check" title="Convertit tous les morceaux cochés à gauche vers le format choisi (morceaux entiers)"><input type="checkbox" id="trBatch"><span>Convertir tous les morceaux cochés (en lot)</span></label>
-  </div>
+  <button class="btn" id="trBatchBtn" title="Convertit les morceaux cochés dans la liste, en entier, vers le format choisi">Convertir les morceaux cochés</button>
   <div class="grow"></div>
   <span class="sum" id="trSum"></span>
   <button class="btn primary" id="trExportBtn">Exporter l'audio</button>
@@ -4816,7 +4813,7 @@ function applyTrimFmt(){
   $("#tr-r-bits").classList.toggle("hide", effFmt !== "wav");
   const ext = effFmt === "copy" ? "." + (trOrigExt || "mp3") : "." + effFmt;
   $("#trExtBadge").textContent = ext;
-  const batch = $("#trBatch").checked;
+  const batch = false;
   const keep = $("#trKeepMeta").checked;
   const destMode = getDestMode();
   $$("#trDestList .dest-opt").forEach(lbl => {
@@ -4859,15 +4856,13 @@ function updateTrimTimesUI(){
 function updateTrimAction(){
   const btn = $("#trExportBtn"), sum = $("#trSum");
   if (!btn || !sum) return;
-  const batch = $("#trBatch").checked;
   const destMode = getDestMode();
   const n = S ? S.files.filter(f => checked.has(f.name)).length : 0;
   const ext = ($("#trExtBadge").textContent || ".mp3").toUpperCase().slice(1);
-  if (batch){
-    btn.textContent = trBusy ? "Conversion en cours…" : (n ? `${destMode === "replace_orig" ? "Remplacer" : "Convertir"} ${n} morceau${n>1?"x":""} en ${ext}` : "Coche au moins 1 morceau");
-    btn.disabled = !S || !S.ffmpeg || trBusy || !n;
-    sum.textContent = n ? `${n} morceau${n>1?"x":""} coché${n>1?"s":""} → ${ext}` : "";
-  } else {
+  const bb = $("#trBatchBtn");
+  bb.textContent = n ? `${destMode === "replace_orig" ? "Remplacer" : "Convertir"} les ${n} morceau${n>1?"x":""} coché${n>1?"s":""} en ${ext}` : "Convertir les morceaux cochés";
+  bb.disabled = !S || !S.ffmpeg || trBusy || !n;
+  {
     const d = Math.max(0, trEnd - trStart);
     const isCut = trStart > 0.05 || (trDur - trEnd) > 0.05;
     btn.textContent = trBusy ? "Export en cours…" : (destMode === "replace_orig" ? `Écraser et enregistrer (${ext})` : isCut ? `Exporter l'extrait (${ext})` : `Convertir en ${ext}`);
@@ -5195,9 +5190,8 @@ function stopTrimAudio(){
   cancelAnimationFrame(trRaf);
 }
 
-async function exportAudio(){
+async function exportAudio(batch){
   if (trBusy) return;
-  const batch = $("#trBatch").checked;
   const files = order.filter(n => checked.has(n));
   if (batch && !files.length) return;
   if (!batch && !trTrack) return;
@@ -5234,7 +5228,7 @@ async function exportAudio(){
     artist: $("#trTagArtist").value,
     out_name: $("#trOutName").value,
     dest_mode: destMode,
-    overwrite: $("#trOverwrite").checked
+    overwrite: false
   };
   const r = await post("/api/audio/export", payload);
   if (!r.ok){
@@ -5518,7 +5512,7 @@ $("#trEndInp").onchange = e => {
   updateTrimTimesUI();
 };
 $("#trOutName").oninput = () => { trNameEdited = true; };
-$("#trFadeIn").onchange = $("#trFadeOut").onchange = $("#trLoud").onchange = $("#trKeepMeta").onchange = $("#trBatch").onchange = applyTrimFmt;
+$("#trFadeIn").onchange = $("#trFadeOut").onchange = $("#trLoud").onchange = $("#trKeepMeta").onchange = applyTrimFmt;
 $("#trZoomIn").onclick = () => zoomAt(trCurTime >= trView.a && trCurTime <= trView.b ? trCurTime : (trView.a + trView.b) / 2, 0.5);
 $("#trZoomOut").onclick = () => zoomAt((trView.a + trView.b) / 2, 2);
 $("#trZoomAll").onclick = () => setView(0, trDur);
@@ -5535,7 +5529,8 @@ $("#trSilence").onclick = async () => {
 };
 $$('input[name="trDestMode"]').forEach(r => r.onchange = applyTrimFmt);
 $("#trCancel").onclick = () => post("/api/audio/cancel").then(() => refresh(true));
-$("#trExportBtn").onclick = exportAudio;
+$("#trExportBtn").onclick = () => exportAudio(false);
+$("#trBatchBtn").onclick = () => exportAudio(true);
 $("#mix").checked = mixOn; $("#mixName").hidden = !mixOn; if (window._mixName) $("#mixName").value = window._mixName;
 $("#mix").onchange = e => { mixOn = e.target.checked; $("#mixName").hidden = !mixOn; saveMix(); renderFiles(); };
 $("#mixName").oninput = saveMix;
