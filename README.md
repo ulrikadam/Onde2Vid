@@ -14,10 +14,23 @@ Tout le traitement est réalisé sur votre ordinateur. Aucun compte, abonnement 
 
 ## Aperçu
 
+<p align="center">
+  <img src="captures/interface-video.png" alt="Interface d’Onde2Vid : liste des morceaux, aperçu et choix du visualiseur" width="860">
+</p>
+
+<p align="center">
+  <img src="captures/visualiseur-corridor.jpg" alt="Visualiseur Couloir 3D" width="420">
+  <img src="captures/visualiseur-cassette.jpg" alt="Visualiseur Cassette K7" width="420">
+  <br>
+  <img src="captures/visualiseur-synthwave.jpg" alt="Visualiseur Horizon néon" width="420">
+  <img src="captures/visualiseur-cqt.jpg" alt="Visualiseur Barres piano" width="420">
+</p>
+<p align="center"><sub>Couloir 3D · Cassette K7 · Horizon néon · Barres piano</sub></p>
+
 Avec Onde2Vid, vous pouvez :
 
 - convertir un ou plusieurs morceaux en MP4 : MP3, WAV, FLAC, M4A/AAC, OGG, Opus, AIFF, WMA… ;
-- choisir parmi plusieurs visualiseurs : mandala, horizon néon, hyperespace, cercle, barres piano (un clavier qui s’allume sur les notes jouées), oscilloscope, égaliseur, onde, spectrogramme, tunnel, aurore, etc. ; certains (horizon néon, hyperespace) accélèrent sur les basses ;
+- choisir parmi plusieurs visualiseurs, dont deux en 3D : **couloir 3D** (on avance entre des cubes néon qui s’allument avec la musique) et **cassette K7** (votre jaquette en étiquette, des bobines qui tournent, un battement sur les basses) ; mais aussi mandala, horizon néon, hyperespace, cercle, barres piano (un clavier qui s’allume sur les notes jouées), oscilloscope, égaliseur, onde, spectrogramme, tunnel, aurore, etc. ; certains (horizon néon, hyperespace) accélèrent sur les basses ;
 - régler l’effet néon (lueur autour du visualiseur) de 0 à 100 %, pour tous les visualiseurs ;
 - utiliser la pochette intégrée au fichier audio, une jaquette personnalisée ou une image de fond ;
 - ajouter un titre, un sous-titre, une barre de progression et des effets de pulsation ;
@@ -28,6 +41,7 @@ Avec Onde2Vid, vous pouvez :
 - donner à chaque morceau ses propres réglages (visualiseur, jaquette, titre…), ou garder les mêmes pour toute la playlist ;
 - faire alterner plusieurs visualiseurs pendant un long morceau (toutes les 1 à 30 minutes) ;
 - convertir plus vite : les longs morceaux sont calculés en plusieurs parties en même temps, et la compression peut passer par la puce graphique — Apple, NVIDIA, AMD ou Intel — sur Mac, Windows et Linux (réglage « Rapide ») ;
+- **découper et convertir vos fichiers audio** (onglet « Découpe & Audio ») : choisir un extrait sur la forme d’onde, ajouter des fondus, retirer les silences, normaliser le volume et exporter en MP3, WAV, FLAC, M4A, OGG ou Opus ;
 - convertir tout le dossier en mode batch, sans interface.
 
 ## Version autonome (sans Python)
@@ -119,6 +133,24 @@ Pour les longs morceaux, cochez **« Changer de visualiseur pendant le morceau �
 
 Le son s’enchaîne sans coupure. Chaque passage garde son titre, sa jaquette et son visualiseur ; le format, la résolution et la qualité sont les mêmes pour toute la vidéo. Les chapitres sont intégrés au MP4, et un fichier texte du même nom est créé à côté (par exemple `0:00 Titre 1`, `5:02 Titre 2`…) : collez-le dans la description YouTube pour obtenir les chapitres (YouTube en demande au moins trois de 10 secondes ou plus).
 
+### Découpe et conversion audio
+
+L’onglet **✂️ Découpe & Audio**, en haut de l’interface, sert à préparer vos fichiers audio avant d’en faire une vidéo, ou simplement à les convertir.
+
+<p align="center">
+  <img src="captures/interface-decoupe.png" alt="Onglet Découpe & Audio : forme d’onde, début et fin de l’extrait, formats de sortie" width="860">
+</p>
+
+- **Choisir un extrait** : cliquez sur un morceau, puis glissez les poignées de début et de fin sur la forme d’onde, ou tapez les temps à la main. Zoomez avec la molette (ou les boutons 🔍) pour couper au dixième de seconde.
+- **Écouter** l’extrait avant de l’exporter, en boucle si besoin, et tester la fin et son fondu.
+- **✨ Retirer les silences** place le début et la fin là où le son commence et s’arrête vraiment.
+- **Fondus** d’entrée et de sortie, et **volume normalisé** (−14 LUFS pour YouTube et Spotify, ou −9 LUFS pour un son plus fort).
+- **Formats de sortie** : MP3, WAV (16 ou 24 bits), FLAC, M4A/AAC, OGG Vorbis, Opus, ou copie directe sans réencodage. Les tags et la jaquette sont conservés.
+- **Destination** : une copie dans `output/` et dans `input/` (pour en faire une vidéo ensuite), une copie dans `output/` seulement, ou le remplacement du fichier d’origine.
+- **Convertir les morceaux cochés** : tous les morceaux cochés dans la liste sont convertis en entier vers le format choisi.
+
+Raccourcis clavier : **Espace** écouter / pause · **I** et **O** placer le début et la fin au curseur · **← →** avancer d’1 s (avec Maj : 0,1 s) · **+ −** zoom · **0** tout voir.
+
 ### Compression par la puce graphique
 
 Avec le réglage **Compression → Rapide** (par défaut), la compression vidéo est confiée à la puce graphique quand elle en est capable : le processeur reste libre pour dessiner le visualiseur, et la conversion va nettement plus vite.
@@ -144,7 +176,7 @@ Onde2Vid/
 ├── Onde2Vid.py
 ├── input/                 # vos fichiers audio et éventuelles images de fond
 │   └── jaquettes/         # jaquettes ajoutées depuis l’interface
-├── output/                # vidéos MP4 générées (et chapitres .txt des compilations)
+├── output/                # vidéos MP4 générées (et chapitres .txt des compilations), extraits audio
 ├── reglages.json          # derniers réglages utilisés
 └── reglages_morceaux.json # réglages propres à certains morceaux
 ```
