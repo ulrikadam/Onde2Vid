@@ -583,6 +583,278 @@ def title_text(mp3: Path, s: dict) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Découpe et conversion de format audio
+# ──────────────────────────────────────────────────────────────────────────────
+
+AUDIO_OUT_FMTS = ("mp3", "m4a", "wav", "flac", "ogg", "opus", "copy")
+AUDIO_COVER_EXTS = {".mp3", ".m4a", ".flac"}
+BROWSER_AUDIO_MIMES = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+    ".m4a": "audio/mp4", ".aac": "audio/aac", ".ogg": "audio/ogg",
+    ".oga": "audio/ogg", ".opus": "audio/opus",
+}
+_peaks_cache: dict = {}
+
+
+def audio_peaks(mp3: Path, n: int = 320) -> list[float]:
+    """Forme d'onde (n barres normalisées entre 0 et 1) pour l'outil de découpe."""
+    if not TOOLS["ffmpeg"]:
+        return [0.1] * n
+    key = (file_key(mp3), n)
+    if key in _peaks_cache:
+        return _peaks_cache[key]
+    dur = probe(mp3)["duration"] or 60.0
+    raw = b""
+    if dur > 480:
+        nslices, workers = 64, 4
+        per_w = nslices // workers
+        is_mp3 = mp3.suffix.lower() == ".mp3"
+
+        def _batch(w: int) -> bytes:
+            cmd = [TOOLS["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostdin"]
+            for j in range(per_w):
+                t = (w * per_w + j + 0.5) * dur / nslices
+                if is_mp3:
+                    cmd += ["-usetoc", "1"]
+                cmd += ["-ss", f"{t:.2f}", "-t", "0.25", "-i", str(mp3)]
+            fc = "".join(f"[{j}:a]" for j in range(per_w)) + f"concat=n={per_w}:v=0:a=1,aresample=1200[a]"
+            cmd += ["-filter_complex", fc, "-map", "[a]", "-ac", "1", "-f", "s16le", "-"]
+            return subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, **NO_WINDOW).stdout
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            raw = b"".join(ex.map(_batch, range(workers)))
+    if not raw:
+        sr = max(100, min(1600, int(n * 24 / max(1.0, dur))))
+        cmd = [TOOLS["ffmpeg"], "-hide_banner", "-loglevel", "error", "-nostdin",
+               "-i", str(mp3), "-vn", "-ac", "1", "-af", f"aresample={sr}", "-f", "s16le", "-"]
+        raw = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, **NO_WINDOW).stdout
+    a = array("h")
+    a.frombytes(raw[:len(raw) // 2 * 2])
+    if sys.byteorder == "big":
+        a.byteswap()
+    total = len(a)
+    if not total:
+        return [0.05] * n
+    vals = []
+    for i in range(n):
+        seg = a[i * total // n:(i + 1) * total // n]
+        if seg:
+            pk = max(abs(min(seg)), abs(max(seg)))
+            rms = (sum(x * x for x in seg) / len(seg)) ** 0.5
+            vals.append(pk * 0.45 + rms * 0.55)
+        else:
+            vals.append(0.0)
+    ref = sorted(vals)[int(len(vals) * 0.98)] or 1.0
+    out = [round(min(1.0, max(0.03, (v / ref) ** 0.85)), 3) for v in vals]
+    _peaks_cache[key] = out
+    return out
+
+
+def browser_audio(mp3: Path, compat: bool = False) -> tuple[Path, str]:
+    """Fichier audio lisible par le navigateur (converti en MP3 temporaire si format non pris en charge)."""
+    ext = mp3.suffix.lower()
+    if not compat and ext in BROWSER_AUDIO_MIMES:
+        return mp3, BROWSER_AUDIO_MIMES[ext]
+    out = TMP / f"play_{short_hash(file_key(mp3))}.mp3"
+    make_asset(out, "-i", mp3, "-vn", "-c:a", "libmp3lame", "-b:a", "192k", what="Lecture audio")
+    return out, "audio/mpeg"
+
+
+def trim_audio(mp3: Path, opts: dict, full_track: bool = False,
+               on_progress=None, set_proc=None) -> dict:
+    """Découpe un fichier audio et/ou change son format vers output/ (et input/ selon dest_mode)."""
+    ensure_tools()
+    ff = TOOLS["ffmpeg"]
+    if not ff:
+        raise RuntimeError("FFmpeg introuvable")
+    info = probe(mp3)
+    total = info["duration"]
+    if total <= 0:
+        raise RuntimeError(f"Durée illisible : {mp3.name}")
+    if full_track:
+        start, end = 0.0, total
+    else:
+        try:
+            start = max(0.0, float(opts.get("start") or 0.0))
+            end = min(total, float(opts.get("end") if opts.get("end") is not None else total))
+        except (TypeError, ValueError):
+            start, end = 0.0, total
+    if end - start < 0.1:
+        raise RuntimeError("L'extrait choisi est trop court (minimum 0,1 s)")
+    dur = end - start
+    fmt = _pick(opts.get("fmt"), AUDIO_OUT_FMTS, "mp3")
+    kbps = _pick(opts.get("kbps"), [96, 128, 160, 192, 256, 320], 320)
+    wav_bits = _pick(opts.get("wav_bits"), [16, 24], 16)
+    try:
+        fade_in = max(0.0, min(30.0, float(opts.get("fade_in") or 0.0)))
+        fade_out = max(0.0, min(30.0, float(opts.get("fade_out") or 0.0)))
+    except (TypeError, ValueError):
+        fade_in = fade_out = 0.0
+    keep_meta = bool(opts.get("keep_meta", True))
+    dest_mode = opts.get("dest_mode")
+    if dest_mode not in ("copy_both", "replace_orig", "copy_out"):
+        dest_mode = "copy_both" if opts.get("to_input", True) else "copy_out"
+    replace_orig = (dest_mode == "replace_orig")
+    overwrite = bool(opts.get("overwrite", False)) or replace_orig
+
+    if fmt == "copy" and (fade_in > 0 or fade_out > 0):
+        src_fmt = mp3.suffix.lower().lstrip(".")
+        fmt = src_fmt if src_fmt in ("mp3", "m4a", "wav", "flac", "ogg", "opus") else "mp3"
+
+    ext = mp3.suffix.lower() if fmt == "copy" else f".{fmt}"
+    is_cut = start > 0.05 or (total - end) > 0.05
+    default_stem = f"{mp3.stem} (extrait)" if is_cut else mp3.stem
+    if full_track or replace_orig:
+        base = mix_name(mp3.stem)
+    else:
+        raw_name = str(opts.get("out_name") or "").strip()
+        if raw_name.lower().endswith(ext):
+            raw_name = raw_name[:-len(ext)].strip()
+        base = mix_name(raw_name or default_stem)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_name, k = base + ext, 2
+    while (OUTPUT_DIR / out_name).exists() and not overwrite:
+        out_name, k = f"{base} ({k}){ext}", k + 1
+    out = OUTPUT_DIR / out_name
+    part = out.with_name(f".{out.stem}.part{ext}")
+
+    af = []
+    if fmt != "copy":
+        fi = min(fade_in, dur)
+        fo = min(fade_out, dur)
+        if fi > 0:
+            af.append(f"afade=t=in:st=0:d={fi:.3f}")
+        if fo > 0:
+            af.append(f"afade=t=out:st={max(0.0, dur - fo):.3f}:d={fo:.3f}")
+
+    if fmt == "copy":
+        cargs = ["-c:a", "copy"]
+    elif fmt == "mp3":
+        cargs = ["-c:a", "libmp3lame", "-b:a", f"{kbps}k", "-id3v2_version", "3"]
+    elif fmt == "m4a":
+        cargs = ["-c:a", "aac", "-b:a", f"{kbps}k", "-movflags", "+faststart"]
+    elif fmt == "wav":
+        cargs = ["-c:a", "pcm_s24le" if wav_bits == 24 else "pcm_s16le"]
+    elif fmt == "flac":
+        cargs = ["-c:a", "flac"]
+    elif fmt == "ogg":
+        cargs = ["-c:a", "libvorbis", "-b:a", f"{kbps}k"]
+    elif fmt == "opus":
+        cargs = ["-c:a", "libopus", "-b:a", f"{kbps}k"]
+    else:
+        cargs = ["-c:a", "libmp3lame", "-b:a", f"{kbps}k"]
+
+    cover_img = None
+    if keep_meta:
+        with ASSET_LOCK:
+            cover_img, _ = track_cover(mp3, settings_for(mp3.name))
+
+    def build_cmd(with_cover: bool) -> list[str]:
+        args: list[str] = [ff, "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+                           "-progress", "pipe:1", "-nostats"]
+        if start > 0:
+            args += ["-ss", f"{start:.3f}"]
+        args += ["-t", f"{dur:.3f}", "-i", str(mp3)]
+        if with_cover and cover_img and ext in AUDIO_COVER_EXTS:
+            args += ["-i", str(cover_img), "-map", "0:a:0", "-map", "1:v:0",
+                     "-c:v", "mjpeg", "-q:v", "2",
+                     "-vf", "scale='min(1400,iw)':'min(1400,ih)':force_original_aspect_ratio=decrease"
+                            ":force_divisible_by=2",
+                     "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)",
+                     "-disposition:v", "attached_pic"]
+        else:
+            args += ["-map", "0:a:0", "-vn"]
+        if af:
+            args += ["-af", ",".join(af)]
+        args += cargs
+        if keep_meta:
+            args += ["-map_metadata", "0"]
+            if not full_track:
+                if "title" in opts and opts["title"] is not None:
+                    args += ["-metadata", f"title={str(opts['title']).strip()[:200]}"]
+                if "artist" in opts and opts["artist"] is not None:
+                    args += ["-metadata", f"artist={str(opts['artist']).strip()[:200]}"]
+        else:
+            args += ["-map_metadata", "-1"]
+        args.append(str(part))
+        return args
+
+    def run_export(with_cover: bool) -> None:
+        cmd = build_cmd(with_cover)
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as errlog:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errlog, stdin=subprocess.DEVNULL,
+                                    text=True, encoding="utf-8", errors="replace", bufsize=1, **NO_WINDOW)
+            if set_proc:
+                set_proc(proc)
+            speed = ""
+            try:
+                for line in proc.stdout:
+                    k_line, _, v_line = line.strip().partition("=")
+                    if k_line in ("out_time_us", "out_time_ms") and v_line.isdigit() and dur and on_progress:
+                        on_progress(min(99.5, int(v_line) / 1e6 / dur * 100), speed)
+                    elif k_line == "speed":
+                        speed = v_line.strip()
+            finally:
+                rc = proc.wait()
+                if set_proc:
+                    set_proc(None)
+            if rc != 0:
+                errlog.seek(0)
+                raise RuntimeError(last_line(errlog.read(), f"ffmpeg a échoué (code {rc})"))
+
+    try:
+        try:
+            run_export(with_cover=True)
+        except RuntimeError:
+            if cover_img and ext in AUDIO_COVER_EXTS and (not isinstance(set_proc, _Run) or not set_proc.cancelled):
+                part.unlink(missing_ok=True)
+                run_export(with_cover=False)
+            else:
+                raise
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    os.replace(part, out)
+
+    in_name = ""
+    if replace_orig:
+        INPUT_DIR.mkdir(parents=True, exist_ok=True)
+        in_dst = INPUT_DIR / (mp3.stem + ext)
+        in_part = INPUT_DIR / f".{mp3.stem}.replace{ext}"
+        shutil.copy2(out, in_part)
+        os.replace(in_part, in_dst)
+        if in_dst.resolve() != mp3.resolve():
+            mp3.unlink(missing_ok=True)
+            if mp3.name in TRACK_SETTINGS:
+                TRACK_SETTINGS[in_dst.name] = TRACK_SETTINGS.pop(mp3.name)
+                save_track_settings(TRACK_SETTINGS)
+        in_name = in_dst.name
+        if keep_meta and cover_img and ext not in AUDIO_COVER_EXTS:
+            try:
+                set_cover(in_dst, cover_img.read_bytes(), cover_img.suffix.lower())
+            except (RuntimeError, OSError):
+                pass
+    elif dest_mode == "copy_both":
+        INPUT_DIR.mkdir(parents=True, exist_ok=True)
+        in_stem = out.stem
+        in_cand, j = f"{in_stem}{ext}", 2
+        while (INPUT_DIR / in_cand).exists() and ((INPUT_DIR / in_cand).resolve() == mp3.resolve() or not overwrite):
+            in_cand, j = f"{in_stem} ({j}){ext}", j + 1
+        in_dst = INPUT_DIR / in_cand
+        shutil.copy2(out, in_dst)
+        in_name = in_dst.name
+        if keep_meta and cover_img and ext not in AUDIO_COVER_EXTS:
+            try:
+                set_cover(in_dst, cover_img.read_bytes(), cover_img.suffix.lower())
+            except (RuntimeError, OSError):
+                pass
+
+    return {"ok": True, "out": out.name, "input_name": in_name, "replaced": replace_orig,
+            "duration": round(dur, 2), "size": out.stat().st_size}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Mise en page
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -2901,6 +3173,123 @@ class Queue:
 QUEUE = Queue()
 
 
+class AudioQueue:
+    """File d'exécution en arrière-plan pour la découpe / conversion audio (avec progression et annulation)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = False
+        self.cancelled = False
+        self.proc = None
+        self.job: dict = {}
+        self.seq = 0
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return dict(self.job)
+
+    def start(self, data: dict) -> str | None:
+        with self.lock:
+            if self.running:
+                return "Un export audio est déjà en cours"
+            batch = bool(data.get("batch"))
+            if batch:
+                names = [Path(str(n)).name for n in data.get("files", [])
+                         if (INPUT_DIR / Path(str(n)).name).is_file()]
+                if not names:
+                    return "Aucun morceau coché"
+            else:
+                name = Path(str(data.get("file", ""))).name
+                mp3 = INPUT_DIR / name
+                if not (mp3.is_file() and mp3.suffix.lower() in AUDIO_EXT):
+                    return "Choisis un morceau à découper"
+                names = [name]
+            self.seq += 1
+            self.running = True
+            self.cancelled = False
+            self.job = {
+                "id": self.seq,
+                "running": True,
+                "status": "run",
+                "progress": 0.0,
+                "speed": "",
+                "name": f"{len(names)} morceaux" if batch else names[0],
+                "current": names[0],
+                "index": 1,
+                "count": len(names),
+                "batch": batch,
+                "error": "",
+                "result": None,
+            }
+        threading.Thread(target=self._work, args=(names, dict(data), batch), daemon=True).start()
+        return None
+
+    def cancel(self) -> None:
+        with self.lock:
+            self.cancelled = True
+            proc = self.proc
+        if proc:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+    def _set_proc(self, p) -> None:
+        with self.lock:
+            self.proc = p
+            stop = p is not None and self.cancelled
+        if stop:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+    def _work(self, names: list[str], data: dict, batch: bool) -> None:
+        n_total = len(names)
+        results = []
+        try:
+            for idx, name in enumerate(names, 1):
+                if self.cancelled:
+                    raise RuntimeError("Export annulé")
+                with self.lock:
+                    self.job["current"] = name
+                    self.job["index"] = idx
+
+                def on_prog(p: float, sp: str, i: int = idx - 1) -> None:
+                    with self.lock:
+                        self.job["progress"] = round(((i * 100.0) + p) / n_total, 1)
+                        if sp:
+                            self.job["speed"] = sp
+
+                res = trim_audio(INPUT_DIR / name, data, full_track=batch,
+                                 on_progress=on_prog, set_proc=self._set_proc)
+                results.append(res)
+                with self.lock:
+                    self.job["progress"] = round((idx / n_total) * 100.0, 1)
+            last = results[-1]
+            summary = {
+                "ok": True,
+                "batch": batch,
+                "count": len(results),
+                "out": last["out"],
+                "input_name": last["input_name"],
+                "replaced": last["replaced"],
+                "size": sum(r["size"] for r in results),
+                "duration": round(sum(r["duration"] for r in results), 2),
+            }
+            with self.lock:
+                self.job.update(running=False, status="ok", progress=100.0, result=summary)
+                self.running = False
+        except Exception as e:  # noqa: BLE001
+            with self.lock:
+                st = "cancel" if self.cancelled else "err"
+                self.job.update(running=False, status=st, error=str(e)[:300])
+                self.running = False
+
+
+AUDIO_QUEUE = AudioQueue()
+
+
 def open_path(p: Path) -> None:
     try:
         if sys.platform == "darwin":
@@ -2924,7 +3313,8 @@ def app_state() -> dict:
                       "tag": f"{info['artist']} – {info['title']}".strip(" –") if info["title"] else "",
                       "done": (OUTPUT_DIR / (f.stem + ".mp4")).exists()})
     return {"files": files, "images": list_images(), "jobs": QUEUE.snapshot(),
-            "running": QUEUE.running, "ffmpeg": TOOLS["ffmpeg"], "x264": TOOLS["x264"],
+            "running": QUEUE.running, "audio_job": AUDIO_QUEUE.snapshot(),
+            "ffmpeg": TOOLS["ffmpeg"], "x264": TOOLS["x264"],
             "hw": HW_NAMES.get(hw_encoder() or "", ""),
             "title_ok": title_ok(), "settings": SETTINGS, "tracks": TRACK_SETTINGS,
             "input": str(INPUT_DIR), "output": str(OUTPUT_DIR)}
@@ -2972,21 +3362,26 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("Host", "") in ALLOWED_HOSTS
 
     def _send_file(self, p: Path, ctype: str) -> None:
-        """Envoi avec prise en charge des « Range » (nécessaire à la vidéo dans Safari)."""
-        data = p.read_bytes()
-        size = len(data)
-        m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
-        if m and (m[1] or m[2]):
-            if m[1]:
-                a, b = int(m[1]), int(m[2]) if m[2] else size - 1
-            else:
-                a, b = max(0, size - int(m[2])), size - 1
-            b = min(b, size - 1)
-            if a > b:
-                return self._send(416, b"", ctype, {"Content-Range": f"bytes */{size}"})
-            return self._send(206, data[a:b + 1], ctype,
-                              {"Content-Range": f"bytes {a}-{b}/{size}", "Accept-Ranges": "bytes"})
-        self._send(200, data, ctype, {"Accept-Ranges": "bytes"})
+        """Envoi avec prise en charge des « Range » (nécessaire à la vidéo et à l'audio)."""
+        try:
+            size = p.stat().st_size
+            m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+            if m and (m[1] or m[2]):
+                if m[1]:
+                    a, b = int(m[1]), int(m[2]) if m[2] else size - 1
+                else:
+                    a, b = max(0, size - int(m[2])), size - 1
+                b = min(b, size - 1)
+                if a > b or a >= size:
+                    return self._send(416, b"", ctype, {"Content-Range": f"bytes */{size}"})
+                with open(p, "rb") as fh:
+                    fh.seek(a)
+                    chunk = fh.read(b - a + 1)
+                return self._send(206, chunk, ctype,
+                                  {"Content-Range": f"bytes {a}-{b}/{size}", "Accept-Ranges": "bytes"})
+            self._send(200, p.read_bytes(), ctype, {"Accept-Ranges": "bytes"})
+        except OSError:
+            self._send(404, b"", "text/plain")
 
     def _read_body(self, limit: int = 1 << 40) -> bytes | None:
         length = int(self.headers.get("Content-Length") or 0)
@@ -3014,6 +3409,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_file(p, "video/mp4")
             else:
                 self._send(404, b"", "text/plain")
+        elif url.path == "/api/audio":
+            ensure_tools()
+            mp3 = INPUT_DIR / Path(unquote(q.get("name", [""])[0])).name
+            compat = q.get("compat", [""])[0] == "1"
+            if not (mp3.is_file() and mp3.suffix.lower() in AUDIO_EXT):
+                return self._send(404, b"", "text/plain")
+            try:
+                p, ctype = browser_audio(mp3, compat=compat)
+                self._send_file(p, ctype)
+            except RuntimeError:
+                self._send(404, b"", "text/plain")
+        elif url.path == "/api/peaks":
+            ensure_tools()
+            mp3 = INPUT_DIR / Path(unquote(q.get("name", [""])[0])).name
+            if not (mp3.is_file() and mp3.suffix.lower() in AUDIO_EXT):
+                return self._json({"ok": False, "error": "Morceau introuvable"})
+            info = probe(mp3)
+            self._json({"ok": True, "name": mp3.name, "stem": mp3.stem,
+                        "ext": mp3.suffix.lower().lstrip("."),
+                        "duration": info["duration"], "title": info["title"],
+                        "artist": info["artist"], "peaks": audio_peaks(mp3)})
         elif url.path == "/api/thumb":
             mp3 = INPUT_DIR / Path(unquote(q.get("name", [""])[0])).name
             size = _clamp_int(q.get("s", ["160"])[0], 40, 600, 160)
@@ -3145,7 +3561,7 @@ class Handler(BaseHTTPRequestHandler):
                     if act == "remove":
                         remove_cover(mp3)
                     elif act == "embed":
-                        if QUEUE.running:
+                        if QUEUE.running or AUDIO_QUEUE.running:
                             raise RuntimeError("Attends la fin de la conversion en cours")
                         embed_cover(mp3, settings_for(mp3.name))
                     elif act == "use":
@@ -3158,6 +3574,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True})
             except (RuntimeError, OSError) as e:
                 self._json({"ok": False, "error": str(e)[:300]})
+        elif url.path == "/api/audio/export":
+            ensure_tools()
+            if not TOOLS["ffmpeg"]:
+                return self._json({"ok": False, "error": "FFmpeg introuvable"})
+            err = AUDIO_QUEUE.start(data)
+            self._json({"ok": err is None, "error": err})
+        elif url.path == "/api/audio/cancel":
+            AUDIO_QUEUE.cancel()
+            self._json({"ok": True})
         elif url.path == "/api/open":
             what = data.get("what")
             if what == "input":
@@ -3168,10 +3593,15 @@ class Handler(BaseHTTPRequestHandler):
                 v = OUTPUT_DIR / (Path(Path(str(data.get("name", ""))).name).stem + ".mp4")
                 if v.is_file():
                     open_path(v)
+            elif what == "out_file":
+                v = OUTPUT_DIR / Path(str(data.get("name", ""))).name
+                if v.is_file():
+                    open_path(v)
             self._json({"ok": True})
         elif url.path == "/api/quit":
             self._json({"ok": True})
             QUEUE.cancel()
+            AUDIO_QUEUE.cancel()
             threading.Thread(target=SERVER.shutdown, daemon=True).start()
         else:
             self._json({"ok": False, "error": "Inconnu"}, 404)
@@ -3334,7 +3764,7 @@ def watchdog() -> None:
     """Mode application : arrêt quand plus aucun onglet n'est ouvert (jamais pendant une conversion)."""
     while True:
         time.sleep(5)
-        if QUEUE.running or PREVIEW_LOCK.locked():
+        if QUEUE.running or AUDIO_QUEUE.running or PREVIEW_LOCK.locked():
             continue
         now, seen, bye = time.monotonic(), ACTIVITY["seen"], ACTIVITY["bye"]
         if (bye > seen and now - bye > BYE_GRACE) or now - seen > IDLE_QUIT:
@@ -3395,6 +3825,7 @@ def run_gui(open_browser: bool = True, app_mode: bool = False) -> None:
         pass
     finally:
         QUEUE.cancel()
+        AUDIO_QUEUE.cancel()
         SERVER.server_close()
         shutil.rmtree(TMP, ignore_errors=True)
         print("  Interface fermée.")
@@ -3575,12 +4006,52 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .cv img{width:100%;height:100%;object-fit:cover;display:block}
 .dlg-btns{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:14px}
 .dlg-btns select{width:auto;max-width:100%}
+.tabs{display:inline-flex;gap:4px;padding:3px;border-radius:11px;background:var(--panel2);border:1px solid var(--line)}
+.tab{border:0;background:transparent;color:var(--muted);padding:6px 14px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:550;display:inline-flex;align-items:center;gap:6px;transition:.12s;white-space:nowrap}
+.tab:hover{color:var(--text)}
+.tab.on{background:var(--panel);color:var(--accent);box-shadow:0 1px 3px rgba(0,0,0,.08);font-weight:650}
+.tr-head{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:11px;background:var(--panel2);border:1px solid var(--line);margin-bottom:12px}
+.tr-head .fname{font-weight:600;font-size:14px}
+.wave-wrap{position:relative;height:148px;border-radius:11px;overflow:hidden;background:#0e0e14;border:1px solid var(--line);user-select:none;touch-action:none}
+.wave-wrap canvas{width:100%;height:100%;display:block}
+.wave-wrap .busy{position:absolute;inset:0;display:none;place-items:center;background:rgba(0,0,0,.55);color:#fff;font-size:13px}
+.wave-wrap.loading .busy{display:grid}
+.tr-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
+.tr-times{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+@media (max-width:640px){.tr-times{grid-template-columns:1fr}.tabs{order:3;width:100%;justify-content:center}header{flex-wrap:wrap}}
+.tbox{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 11px;display:flex;flex-direction:column;gap:6px}
+.tbox-h{display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--muted);font-weight:600}
+.tbox-b{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.time-inp{width:86px!important;font-variant-numeric:tabular-nums;font-weight:600;text-align:center;padding:5px 7px!important;background:var(--panel)!important}
+.fmt-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:7px;margin-bottom:14px}
+@media (max-width:760px){.fmt-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+.fmt-btn{border:1.5px solid var(--line);border-radius:10px;padding:8px 6px;text-align:center;cursor:pointer;background:var(--panel);transition:.12s;display:flex;flex-direction:column;gap:2px}
+.fmt-btn:hover{border-color:color-mix(in srgb,var(--text) 25%,var(--line))}
+.fmt-btn.on{border-color:var(--accent);background:var(--sel)}
+.fmt-btn b{font-size:13px;font-weight:650}
+.fmt-btn small{font-size:10.5px;color:var(--muted)}
+.dest-list{display:flex;flex-direction:column;gap:7px;margin-bottom:6px}
+.dest-opt{display:flex;align-items:flex-start;gap:10px;padding:9px 12px;border:1.5px solid var(--line);border-radius:10px;background:var(--panel2);cursor:pointer;transition:.12s}
+.dest-opt:hover{border-color:color-mix(in srgb,var(--text) 25%,var(--line))}
+.dest-opt.on{border-color:var(--accent);background:var(--sel)}
+.dest-opt.warn.on{border-color:var(--warn);background:color-mix(in srgb,var(--warn) 10%,var(--panel))}
+.dest-opt input{accent-color:var(--accent);margin-top:3px;width:16px;height:16px;flex:none}
+.dest-opt div{display:flex;flex-direction:column;gap:1px;min-width:0}
+.dest-opt b{font-size:13px;font-weight:600}
+.dest-opt small{font-size:12px;color:var(--muted)}
+.progbox{background:var(--panel2);border:1px solid color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:11px;padding:12px 14px;margin-top:12px}
+.progbox .bar{height:8px;margin-top:8px}
+.okbox{background:color-mix(in srgb,var(--ok) 11%,var(--panel));border:1px solid color-mix(in srgb,var(--ok) 40%,transparent);border-radius:11px;padding:12px 14px;font-size:13px;margin-top:12px;display:flex;flex-wrap:wrap;align-items:center;gap:10px}
 </style>
 </head>
 <body>
 <header>
   <div class="logo">__LOGO__</div>
   <div><h1>Onde2Vid</h1><div class="sub">Ta musique en vidéos animées pour YouTube</div></div>
+  <nav class="tabs" id="mainTabs">
+    <button class="tab on" data-tab="video">🎬 Vidéo MP4</button>
+    <button class="tab" data-tab="audio">✂️ Découpe &amp; Audio</button>
+  </nav>
   <div class="grow"></div>
   <a class="credit" href="https://nexadam.be" target="_blank" rel="noopener">Développé par Adam Ulrik · nexadam.be</a>
   <span class="pill" id="ffpill"><span class="dot"></span><span id="fftext">…</span></span>
@@ -3605,7 +4076,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
           <button class="btn small" id="openIn">Dossier input</button>
           <button class="btn small" id="openOut">Dossier output</button>
         </div>
-        <div class="samebar"><label class="check"><input type="checkbox" id="same"><span>Mêmes réglages pour toute la playlist</span></label></div>
+        <div class="samebar" id="sameBar"><label class="check"><input type="checkbox" id="same"><span>Mêmes réglages pour toute la playlist</span></label></div>
         <div class="files" id="files"></div>
         <p class="hint" id="filesHint"></p>
       </div>
@@ -3617,7 +4088,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
     </div>
   </div>
 
-  <div class="col">
+  <div class="col" id="videoCol">
     <div class="card">
       <div class="card-h"><h2>Aperçu</h2></div>
       <div class="card-b">
@@ -3747,9 +4218,149 @@ input[type=range]{width:100%;accent-color:var(--accent)}
       </div>
     </div>
   </div>
+
+  <div class="col" id="audioCol" hidden>
+    <div class="card">
+      <div class="card-h"><h2>Découpe et écoute</h2><div class="grow"></div><span class="pill" id="trDurPill">Extrait : 0:00.0</span></div>
+      <div class="card-b">
+        <div class="empty" id="trEmpty" hidden>Choisis ou glisse un morceau dans la liste à gauche pour le découper ou convertir son format.</div>
+        <div id="trMain">
+          <div class="tr-head">
+            <div class="thumb" id="trThumb">♪</div>
+            <div class="fname"><span id="trName">—</span><small id="trSub"></small></div>
+            <span class="tag" id="trOrigFmt">—</span>
+          </div>
+          <div class="wave-wrap" id="waveWrap">
+            <canvas id="waveCv"></canvas>
+            <div class="busy"><div><div class="spin"></div>Analyse de l'onde…</div></div>
+          </div>
+          <audio id="trAudio" preload="metadata" hidden></audio>
+          <div class="tr-bar">
+            <button class="btn" id="trPlay" style="font-weight:600">▶ Écouter l'extrait</button>
+            <button class="btn small" id="trFromStart" title="Revenir au début de l'extrait">⏮ Début</button>
+            <button class="btn small" id="trTestEnd" title="Écouter les 3 dernières secondes de l'extrait (et son fondu)">⏭ Tester la fin</button>
+            <label class="check" style="font-size:12.5px"><input type="checkbox" id="trLoop"><span>Boucler</span></label>
+            <div class="grow"></div>
+            <button class="btn small" id="trFull" title="Sélectionner tout le morceau (de 0:00 à la fin)">Tout le morceau</button>
+          </div>
+          <div class="tr-times">
+            <div class="tbox">
+              <div class="tbox-h"><span>Début de l'extrait</span><button class="btn small" id="trSetStart" title="Placer le début sur la position d'écoute actuelle">📍 Au curseur</button></div>
+              <div class="tbox-b">
+                <button class="btn small" data-step="s:-1">-1s</button>
+                <button class="btn small" data-step="s:-0.1">-0,1s</button>
+                <input type="text" class="time-inp" id="trStartInp" value="0:00.0" title="Format m:ss.d ou secondes">
+                <button class="btn small" data-step="s:0.1">+0,1s</button>
+                <button class="btn small" data-step="s:1">+1s</button>
+              </div>
+            </div>
+            <div class="tbox">
+              <div class="tbox-h"><span>Fin de l'extrait</span><button class="btn small" id="trSetEnd" title="Placer la fin sur la position d'écoute actuelle">📍 Au curseur</button></div>
+              <div class="tbox-b">
+                <button class="btn small" data-step="e:-1">-1s</button>
+                <button class="btn small" data-step="e:-0.1">-0,1s</button>
+                <input type="text" class="time-inp" id="trEndInp" value="0:00.0" title="Format m:ss.d ou secondes">
+                <button class="btn small" data-step="e:0.1">+0,1s</button>
+                <button class="btn small" data-step="e:1">+1s</button>
+              </div>
+            </div>
+          </div>
+          <p class="hint">Glisse les poignées sur la forme d'onde pour choisir le début et la fin, ou clique dedans pour déplacer le curseur d'écoute.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><h2>Format de sortie et options</h2></div>
+      <div class="card-b">
+        <div class="fmt-grid" id="trFmts"></div>
+        <div class="grid2">
+          <div>
+            <div class="row" id="tr-r-kbps"><label>Qualité audio</label>
+              <select id="trKbps">
+                <option value="128">128 kb/s (léger)</option>
+                <option value="192">192 kb/s (standard)</option>
+                <option value="256">256 kb/s (haute)</option>
+                <option value="320" selected>320 kb/s (maximale)</option>
+              </select></div>
+            <div class="row hide" id="tr-r-bits"><label>Résolution WAV</label>
+              <select id="trWavBits">
+                <option value="16" selected>16 bits (qualité CD)</option>
+                <option value="24">24 bits (studio)</option>
+              </select></div>
+            <div class="row"><label>Fondu d'entrée</label>
+              <select id="trFadeIn">
+                <option value="0" selected>Aucun</option>
+                <option value="0.5">0,5 seconde</option>
+                <option value="1">1 seconde</option>
+                <option value="2">2 secondes</option>
+                <option value="3">3 secondes</option>
+                <option value="5">5 secondes</option>
+              </select></div>
+            <div class="row"><label>Fondu de sortie</label>
+              <select id="trFadeOut">
+                <option value="0" selected>Aucun</option>
+                <option value="0.5">0,5 seconde</option>
+                <option value="1">1 seconde</option>
+                <option value="2">2 secondes</option>
+                <option value="3">3 secondes</option>
+                <option value="5">5 secondes</option>
+              </select></div>
+          </div>
+          <div>
+            <div class="row" id="tr-r-name"><label>Nom du fichier</label>
+              <div class="inline"><input type="text" id="trOutName" maxlength="80" placeholder="Nom du fichier"><span class="pill" id="trExtBadge">.mp3</span></div></div>
+            <div class="row"><label>Métadonnées</label>
+              <label class="check"><input type="checkbox" id="trKeepMeta" checked><span>Conserver les tags et la jaquette</span></label></div>
+            <div class="row" id="tr-r-title"><label>Titre (tag)</label>
+              <input type="text" id="trTagTitle" maxlength="120" placeholder="Titre du morceau"></div>
+            <div class="row" id="tr-r-artist"><label>Artiste (tag)</label>
+              <input type="text" id="trTagArtist" maxlength="120" placeholder="Artiste"></div>
+          </div>
+        </div>
+        <div class="sect">
+          <h3>Destination et fichier d'origine</h3>
+          <div class="dest-list" id="trDestList">
+            <label class="dest-opt on">
+              <input type="radio" name="trDestMode" value="copy_both" checked>
+              <div>
+                <b>Créer une copie (conserver le fichier d'origine)</b>
+                <small>Enregistre le nouveau fichier dans <code>output/</code> et ajoute aussi une copie dans <code>input/</code> pour pouvoir en faire une vidéo</small>
+              </div>
+            </label>
+            <label class="dest-opt warn">
+              <input type="radio" name="trDestMode" value="replace_orig">
+              <div>
+                <b>Écraser / remplacer le fichier d'origine</b>
+                <small>Remplace directement le morceau d'origine dans <code>input/</code> par la version découpée ou convertie (et enregistre une copie dans <code>output/</code>)</small>
+              </div>
+            </label>
+            <label class="dest-opt">
+              <input type="radio" name="trDestMode" value="copy_out">
+              <div>
+                <b>Créer une copie uniquement dans <code>output/</code></b>
+                <small>Garde le dossier <code>input/</code> intact et enregistre seulement le résultat dans <code>output/</code></small>
+              </div>
+            </label>
+          </div>
+          <p class="hint" id="trMetaHint"></p>
+        </div>
+        <div class="progbox" id="trProgBox" hidden>
+          <div class="job-top">
+            <div class="fname" id="trProgName">Découpe et conversion en cours…</div>
+            <span class="job-st" id="trProgSt">0 %</span>
+            <button class="btn small" id="trCancel">Annuler</button>
+          </div>
+          <div class="bar"><i id="trProgBar" style="width:0%"></i></div>
+        </div>
+        <div class="okbox" id="trResult" hidden></div>
+        <p class="hint err" id="trErr" hidden></p>
+      </div>
+    </div>
+  </div>
 </main>
 
-<div class="action">
+<div class="action" id="videoAction">
   <div class="opts">
     <label class="check"><input type="checkbox" id="force"><span>Refaire les vidéos déjà converties</span></label>
     <label class="check" title="Les morceaux cochés s'enchaînent dans une seule vidéo, chacun avec son titre et sa jaquette"><input type="checkbox" id="mix"><span>Une seule vidéo avec les morceaux cochés</span></label>
@@ -3758,6 +4369,16 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   <div class="grow"></div>
   <span class="sum" id="sum"></span>
   <button class="btn primary" id="go">Convertir</button>
+</div>
+
+<div class="action" id="audioAction" hidden>
+  <div class="opts">
+    <label class="check"><input type="checkbox" id="trOverwrite"><span>Remplacer si le fichier existe déjà dans output/</span></label>
+    <label class="check" title="Convertit tous les morceaux cochés à gauche vers le format choisi (morceaux entiers)"><input type="checkbox" id="trBatch"><span>Convertir tous les morceaux cochés (en lot)</span></label>
+  </div>
+  <div class="grow"></div>
+  <span class="sum" id="trSum"></span>
+  <button class="btn primary" id="trExportBtn">Exporter l'audio</button>
 </div>
 
 <div class="overlay" id="coverDlg"><div>
@@ -3901,10 +4522,14 @@ function useSettingsFor(){                 // le panneau montre les réglages du
   if (same() || !selected) settings = globalSet;
   else settings = tracks[selected] || JSON.parse(JSON.stringify(globalSet));   // brouillon tant qu'on ne change rien
   $("#same").checked = same();
-  $("#filesHint").textContent = same()
-    ? "Décoche la case ci-dessus pour régler chaque morceau séparément (visualiseur, jaquette, fond…). Clique sur la vignette d'un morceau pour changer sa jaquette."
-    : "Clique sur un morceau : les réglages à droite ne concernent que lui. Clique sur sa vignette pour changer sa jaquette.";
+  $("#sameBar").hidden = (curTab === "audio");
+  $("#filesHint").textContent = curTab === "audio"
+    ? "Clique sur un morceau pour afficher sa forme d'onde et le découper, ou coche plusieurs morceaux pour convertir leur format en lot."
+    : same()
+      ? "Décoche la case ci-dessus pour régler chaque morceau séparément (visualiseur, jaquette, fond…). Clique sur la vignette d'un morceau pour changer sa jaquette."
+      : "Clique sur un morceau : les réglages à droite ne concernent que lui. Clique sur sa vignette pour changer sa jaquette.";
   lastImgs = ""; fillImages(); applySettings(); renderScope(); renderMyCover();
+  if (curTab === "audio") syncTrimTrack();
 }
 function renderScope(){
   const per = !same() && selected, own = !!curTrack(), box = $("#scope"), b = $("#scopeBtn"), t = $("#scopeTxt");
@@ -4038,6 +4663,7 @@ function updateAction(){
   const n = S ? S.files.filter(f => checked.has(f.name)).length : 0;
   const go = $("#go");
   const tot = S ? S.files.filter(f => checked.has(f.name)).reduce((a,f) => a + (f.duration||0), 0) : 0;
+  updateTrimAction();
   if (mixOn){
     go.textContent = S && S.running ? "Conversion en cours…" : (n >= 2 ? `Créer 1 vidéo (${n} morceaux)` : "Coche au moins 2 morceaux");
     go.disabled = !S || S.running || n < 2 || !S.ffmpeg;
@@ -4047,6 +4673,550 @@ function updateAction(){
   go.textContent = S && S.running ? "Conversion en cours…" : (n ? `Convertir ${n} morceau${n>1?"x":""}` : "Convertir");
   go.disabled = !S || S.running || !n || !S.ffmpeg;
   $("#sum").textContent = n ? `${n} sélectionné${n>1?"s":""} · ${fmt(tot)} de musique` : "";
+}
+
+/* ── découpe et conversion audio ── */
+const AUDIO_FMTS = [
+  ["mp3", "MP3", "Universel · .mp3"],
+  ["wav", "WAV", "Sans perte · .wav"],
+  ["flac", "FLAC", "Sans perte · .flac"],
+  ["m4a", "M4A / AAC", "Apple / Web · .m4a"],
+  ["ogg", "OGG Vorbis", "Libre · .ogg"],
+  ["opus", "Opus", "Compact · .opus"],
+  ["copy", "Copie directe", "Même format"]
+];
+let curTab = "video";
+let trTrack = null, trStem = "", trOrigExt = "mp3", trDur = 0, trPeaks = [];
+let trStart = 0, trEnd = 0, trCurTime = 0, trFmt = "mp3", trNameEdited = false, trBusy = false, trRaf = 0, trDrag = null;
+let lastAudioJobId = 0;
+
+function getDestMode(){
+  const r = document.querySelector('input[name="trDestMode"]:checked');
+  return r ? r.value : "copy_both";
+}
+
+const fmtPrecise = s => {
+  s = Math.max(0, Number(s) || 0);
+  if (s >= 3600){
+    const h = Math.floor(s / 3600), m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+    const sec = (s % 60).toFixed(1).padStart(4, "0");
+    return `${h}:${m}:${sec}`;
+  }
+  const m = Math.floor(s / 60), sec = (s % 60).toFixed(1).padStart(4, "0");
+  return `${m}:${sec}`;
+};
+const parseTime = (str, fallback) => {
+  const clean = String(str || "").trim().replace(",", ".");
+  if (!clean) return fallback;
+  const parts = clean.split(":").map(Number);
+  if (parts.some(isNaN)) return fallback;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return parts[0];
+};
+const fmtBytes = b => b >= 1048576 ? (b / 1048576).toFixed(1).replace(".", ",") + " Mo" : Math.max(1, Math.round(b / 1024)) + " Ko";
+
+function setTab(tab){
+  curTab = tab;
+  $$("#mainTabs .tab").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
+  $("#videoCol").hidden = (tab !== "video");
+  $("#audioCol").hidden = (tab !== "audio");
+  $("#videoAction").hidden = (tab !== "video");
+  $("#audioAction").hidden = (tab !== "audio");
+  if (tab === "audio"){
+    $("#pvvid").pause();
+    useSettingsFor();
+    syncTrimTrack();
+    requestAnimationFrame(drawWave);
+  } else {
+    stopTrimAudio();
+    useSettingsFor();
+  }
+}
+
+function buildAudioFmts(){
+  const box = $("#trFmts"); box.innerHTML = "";
+  for (const [k, title, sub] of AUDIO_FMTS){
+    const b = el("div", "fmt-btn" + (k === trFmt ? " on" : ""));
+    b.dataset.fmt = k;
+    b.append(el("b", null, title), el("small", null, sub));
+    b.onclick = () => { trFmt = k; applyTrimFmt(); };
+    box.appendChild(b);
+  }
+}
+
+function applyTrimFmt(){
+  $$("#trFmts .fmt-btn").forEach(b => b.classList.toggle("on", b.dataset.fmt === trFmt));
+  const hasFades = Number($("#trFadeIn").value) > 0 || Number($("#trFadeOut").value) > 0;
+  const effFmt = (trFmt === "copy" && hasFades)
+    ? (["mp3","m4a","wav","flac","ogg","opus"].includes(trOrigExt) ? trOrigExt : "mp3")
+    : trFmt;
+  const lossy = ["mp3", "m4a", "ogg", "opus"].includes(effFmt);
+  $("#tr-r-kbps").classList.toggle("hide", !lossy);
+  $("#tr-r-bits").classList.toggle("hide", effFmt !== "wav");
+  const ext = effFmt === "copy" ? "." + (trOrigExt || "mp3") : "." + effFmt;
+  $("#trExtBadge").textContent = ext;
+  const batch = $("#trBatch").checked;
+  const keep = $("#trKeepMeta").checked;
+  const destMode = getDestMode();
+  $$("#trDestList .dest-opt").forEach(lbl => {
+    const inp = lbl.querySelector("input");
+    lbl.classList.toggle("on", !!(inp && inp.checked));
+  });
+  $("#tr-r-name").classList.toggle("hide", batch || destMode === "replace_orig");
+  $("#tr-r-title").classList.toggle("hide", !keep || batch);
+  $("#tr-r-artist").classList.toggle("hide", !keep || batch);
+  const coverOk = ["mp3", "m4a", "flac"].includes(effFmt === "copy" ? trOrigExt : effFmt);
+  let hint = destMode === "replace_orig"
+    ? "⚠ Le fichier d'origine dans input/ sera remplacé par cette nouvelle version (et copié dans output/)."
+    : "Le fichier d'origine est conservé intact.";
+  if (trFmt === "copy" && hasFades){
+    hint += ` Comme un fondu est activé, le fichier sera réencodé en .${effFmt}.`;
+  } else if (keep && !coverOk){
+    hint += ` Le format ${ext.toUpperCase()} n'embarque pas de pochette dans le fichier (si tu l'ajoutes à input/, sa jaquette est conservée à part).`;
+  }
+  $("#trMetaHint").textContent = hint;
+  updateTrimAction();
+  drawWave();
+}
+
+function updateDefaultOutName(){
+  if (trNameEdited || !trStem) return;
+  const isCut = trStart > 0.05 || (trDur - trEnd) > 0.05;
+  $("#trOutName").value = isCut ? `${trStem} (extrait)` : trStem;
+}
+
+function updateTrimTimesUI(){
+  if (document.activeElement !== $("#trStartInp")) $("#trStartInp").value = fmtPrecise(trStart);
+  if (document.activeElement !== $("#trEndInp")) $("#trEndInp").value = fmtPrecise(trEnd);
+  const d = Math.max(0, trEnd - trStart);
+  $("#trDurPill").textContent = trDur ? `Extrait : ${fmtPrecise(d)} / ${fmtPrecise(trDur)}` : "Extrait : 0:00.0";
+  updateDefaultOutName();
+  updateTrimAction();
+  drawWave();
+}
+
+function updateTrimAction(){
+  const btn = $("#trExportBtn"), sum = $("#trSum");
+  if (!btn || !sum) return;
+  const batch = $("#trBatch").checked;
+  const destMode = getDestMode();
+  const n = S ? S.files.filter(f => checked.has(f.name)).length : 0;
+  const ext = ($("#trExtBadge").textContent || ".mp3").toUpperCase().slice(1);
+  if (batch){
+    btn.textContent = trBusy ? "Conversion en cours…" : (n ? `${destMode === "replace_orig" ? "Remplacer" : "Convertir"} ${n} morceau${n>1?"x":""} en ${ext}` : "Coche au moins 1 morceau");
+    btn.disabled = !S || !S.ffmpeg || trBusy || !n;
+    sum.textContent = n ? `${n} morceau${n>1?"x":""} coché${n>1?"s":""} → ${ext}` : "";
+  } else {
+    const d = Math.max(0, trEnd - trStart);
+    const isCut = trStart > 0.05 || (trDur - trEnd) > 0.05;
+    btn.textContent = trBusy ? "Export en cours…" : (destMode === "replace_orig" ? `Écraser et enregistrer (${ext})` : isCut ? `Exporter l'extrait (${ext})` : `Convertir en ${ext}`);
+    btn.disabled = !S || !S.ffmpeg || trBusy || !trTrack || d < 0.1;
+    sum.textContent = trTrack ? `${isCut ? "Extrait de " + fmtPrecise(d) : "Morceau entier (" + fmtPrecise(trDur) + ")"} → ${ext}` : "";
+  }
+}
+
+async function syncTrimTrack(){
+  const target = selected || (S && S.files[0] && S.files[0].name) || null;
+  const hasFiles = !!(S && S.files.length && target);
+  $("#trEmpty").hidden = hasFiles;
+  $("#trMain").hidden = !hasFiles;
+  if (!hasFiles){
+    trTrack = null; trDur = 0; trPeaks = []; stopTrimAudio(); updateTrimAction(); return;
+  }
+  const f = S.files.find(x => x.name === target);
+  const th = $("#trThumb");
+  th.innerHTML = ""; th.className = "thumb" + (f && f.cover_src ? " has" : "");
+  if (f && f.cover_src){
+    const im = el("img"); im.alt = ""; im.src = `/api/thumb?name=${enc(f.name)}&v=${f.cover_v}`; th.appendChild(im);
+  } else th.textContent = "♪";
+  if (trTrack === target) { updateTrimAction(); return; }
+  stopTrimAudio();
+  trTrack = target;
+  trStem = target.replace(/\.[^.]+$/, "");
+  trOrigExt = extOf(target).slice(1) || "mp3";
+  trNameEdited = false;
+  $("#trName").textContent = target;
+  $("#trSub").textContent = (f && f.tag) || "";
+  $("#trOrigFmt").textContent = trOrigExt.toUpperCase() + (f && f.duration ? " · " + fmt(f.duration) : "");
+  $("#trResult").hidden = true;
+  $("#trErr").hidden = true;
+  trDur = (f && f.duration) || 0;
+  trStart = 0; trEnd = trDur; trCurTime = 0;
+  trPeaks = [];
+  updateTrimTimesUI();
+  applyTrimFmt();
+  $("#waveWrap").classList.add("loading");
+  const aud = $("#trAudio");
+  aud.dataset.compat = "";
+  aud.src = `/api/audio?name=${enc(target)}`;
+  try{
+    const r = await fetch(`/api/peaks?name=${enc(target)}`, {cache:"no-store"});
+    const j = await r.json();
+    if (trTrack !== target) return;
+    if (j.ok){
+      if (!trDur && j.duration){ trDur = j.duration; trEnd = trDur; }
+      trPeaks = j.peaks || [];
+      $("#trTagTitle").value = j.title || trStem;
+      $("#trTagArtist").value = j.artist || "";
+      updateTrimTimesUI();
+      applyTrimFmt();
+    }
+  }catch(e){}
+  $("#waveWrap").classList.remove("loading");
+  drawWave();
+}
+
+function drawWave(){
+  const cv = $("#waveCv");
+  if (!cv || cv.offsetParent === null) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth || 600, H = cv.clientHeight || 148;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)){
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  }
+  const ctx = cv.getContext("2d");
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#0e0e14";
+  ctx.fillRect(0, 0, W, H);
+  if (!trDur || !trPeaks.length){
+    ctx.fillStyle = "#7a7a88";
+    ctx.font = "13px -apple-system, BlinkMacSystemFont, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Aucune forme d'onde", W / 2, H / 2 + 4);
+    ctx.restore();
+    return;
+  }
+  const padX = 12, uw = W - 2 * padX;
+  const xOf = t => padX + Math.max(0, Math.min(1, t / trDur)) * uw;
+  const xs = xOf(trStart), xe = xOf(trEnd), xc = xOf(trCurTime);
+  const fi = Number($("#trFadeIn").value) || 0, fo = Number($("#trFadeOut").value) || 0;
+  const selDur = Math.max(0.01, trEnd - trStart);
+
+  // Zone sélectionnée
+  ctx.fillStyle = "rgba(107, 92, 255, 0.13)";
+  ctx.fillRect(xs, 0, Math.max(1, xe - xs), H);
+
+  // Barres de l'onde
+  const n = trPeaks.length, step = uw / n, bw = Math.max(1.4, step * 0.66);
+  const midY = (H - 18) / 2 + 6, maxH = (H - 38) / 2;
+  const grad = ctx.createLinearGradient(xs, 0, xe, 0);
+  grad.addColorStop(0, "#00e5ff");
+  grad.addColorStop(0.5, "#6b5cff");
+  grad.addColorStop(1, "#ff3df5");
+
+  for (let i = 0; i < n; i++){
+    const bx = padX + (i + 0.5) * step;
+    const bt = (i + 0.5) / n * trDur;
+    const inSel = bt >= trStart && bt <= trEnd;
+    let env = 1;
+    if (inSel && trFmt !== "copy"){
+      const rel = bt - trStart, rem = trEnd - bt;
+      if (fi > 0 && rel < fi) env *= Math.max(0.08, rel / Math.min(fi, selDur));
+      if (fo > 0 && rem < fo) env *= Math.max(0.08, rem / Math.min(fo, selDur));
+    }
+    const bh = Math.max(2, trPeaks[i] * maxH * env);
+    ctx.fillStyle = inSel ? grad : "rgba(140, 140, 165, 0.25)";
+    ctx.beginPath();
+    ctx.roundRect(bx - bw / 2, midY - bh, bw, bh * 2, 1.5);
+    ctx.fill();
+  }
+
+  // Courbes de fondu (fade in / fade out)
+  if (trFmt !== "copy" && (fi > 0 || fo > 0)){
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.45)";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    if (fi > 0){
+      const xfi = xOf(Math.min(trEnd, trStart + fi));
+      ctx.beginPath(); ctx.moveTo(xs, H - 22); ctx.lineTo(xfi, 14); ctx.stroke();
+    }
+    if (fo > 0){
+      const xfo = xOf(Math.max(trStart, trEnd - fo));
+      ctx.beginPath(); ctx.moveTo(xfo, 14); ctx.lineTo(xe, H - 22); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
+  // Graduations de temps en bas
+  ctx.fillStyle = "rgba(180, 180, 200, 0.55)";
+  ctx.font = "10.5px -apple-system, BlinkMacSystemFont, sans-serif";
+  ctx.textAlign = "center";
+  const ticksN = Math.max(3, Math.min(8, Math.floor(uw / 85)));
+  for (let i = 0; i <= ticksN; i++){
+    const t = (i / ticksN) * trDur, tx = xOf(t);
+    ctx.fillRect(tx - 0.5, H - 16, 1, 4);
+    if (i > 0 && i < ticksN) ctx.fillText(fmt(t), tx, H - 4);
+  }
+
+  // Curseur de lecture
+  if (trCurTime >= 0 && trCurTime <= trDur){
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1.8;
+    ctx.beginPath(); ctx.moveTo(xc, 0); ctx.lineTo(xc, H - 16); ctx.stroke();
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.arc(xc, 6, 3.5, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Poignées Début et Fin
+  const drawHandle = (x, col, label, leftAlign) => {
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.roundRect(x - 6, midY - 16, 12, 32, 5); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(x - 2, midY - 7, 1, 14);
+    ctx.fillRect(x + 1, midY - 7, 1, 14);
+    ctx.font = "600 10.5px -apple-system, BlinkMacSystemFont, sans-serif";
+    const tw = ctx.measureText(label).width + 10;
+    const lx = leftAlign ? Math.min(W - tw - 2, x + 4) : Math.max(2, x - tw - 4);
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.roundRect(lx, 4, tw, 17, 5); ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "left";
+    ctx.fillText(label, lx + 5, 16);
+  };
+  drawHandle(xs, "#6b5cff", fmtPrecise(trStart), true);
+  drawHandle(xe, "#ff3df5", fmtPrecise(trEnd), false);
+  ctx.restore();
+}
+
+function bindWaveform(){
+  const cv = $("#waveCv"), aud = $("#trAudio");
+  const posFromEvent = e => {
+    const r = cv.getBoundingClientRect();
+    const clientX = e.touches && e.touches.length ? e.touches[0].clientX : e.clientX;
+    const padX = 12, uw = Math.max(1, r.width - 2 * padX);
+    const x = clientX - r.left;
+    const t = Math.max(0, Math.min(trDur, ((x - padX) / uw) * trDur));
+    const xs = padX + (trStart / trDur) * uw, xe = padX + (trEnd / trDur) * uw;
+    return {x, t, xs, xe};
+  };
+  const onDown = e => {
+    if (!trDur) return;
+    const {x, t, xs, xe} = posFromEvent(e);
+    if (Math.abs(x - xs) <= 12 && Math.abs(x - xs) <= Math.abs(x - xe)) trDrag = "start";
+    else if (Math.abs(x - xe) <= 12) trDrag = "end";
+    else {
+      trDrag = "seek";
+      trCurTime = t;
+      aud.currentTime = t;
+      drawWave();
+    }
+  };
+  const onMove = e => {
+    if (!trDur) return;
+    const {x, t, xs, xe} = posFromEvent(e);
+    if (!trDrag){
+      cv.style.cursor = (Math.abs(x - xs) <= 12 || Math.abs(x - xe) <= 12) ? "ew-resize" : "pointer";
+      return;
+    }
+    e.preventDefault();
+    if (trDrag === "start"){
+      trStart = Math.max(0, Math.min(t, trEnd - 0.2));
+      trCurTime = trStart;
+      if (aud.paused) aud.currentTime = trStart;
+      updateTrimTimesUI();
+    } else if (trDrag === "end"){
+      trEnd = Math.min(trDur, Math.max(t, trStart + 0.2));
+      updateTrimTimesUI();
+    } else if (trDrag === "seek"){
+      trCurTime = t;
+      aud.currentTime = t;
+      drawWave();
+    }
+  };
+  const onUp = () => { trDrag = null; };
+  cv.addEventListener("mousedown", onDown);
+  window.addEventListener("mousemove", onMove);
+  window.addEventListener("mouseup", onUp);
+  cv.addEventListener("touchstart", onDown, {passive: true});
+  window.addEventListener("touchmove", onMove, {passive: false});
+  window.addEventListener("touchend", onUp);
+  window.addEventListener("resize", () => { if (curTab === "audio") drawWave(); });
+
+  aud.onerror = () => {
+    if (trTrack && !aud.dataset.compat){
+      aud.dataset.compat = "1";
+      aud.src = `/api/audio?name=${enc(trTrack)}&compat=1`;
+    }
+  };
+  aud.onplay = () => {
+    $("#trPlay").textContent = "⏸ Pause";
+    const tick = () => {
+      if (aud.paused) return;
+      trCurTime = aud.currentTime;
+      const fi = Number($("#trFadeIn").value) || 0, fo = Number($("#trFadeOut").value) || 0;
+      let vol = 1;
+      if (trFmt !== "copy" && trCurTime >= trStart && trCurTime <= trEnd){
+        const rel = trCurTime - trStart, rem = trEnd - trCurTime, d = Math.max(0.1, trEnd - trStart);
+        if (fi > 0 && rel < fi) vol *= Math.max(0, Math.min(1, rel / Math.min(fi, d)));
+        if (fo > 0 && rem < fo) vol *= Math.max(0, Math.min(1, rem / Math.min(fo, d)));
+      }
+      aud.volume = Math.max(0, Math.min(1, vol));
+      if (trCurTime >= trEnd - 0.02){
+        if ($("#trLoop").checked){
+          aud.currentTime = trStart;
+          trCurTime = trStart;
+        } else {
+          aud.pause();
+          aud.currentTime = trStart;
+          trCurTime = trStart;
+          drawWave();
+          return;
+        }
+      }
+      drawWave();
+      trRaf = requestAnimationFrame(tick);
+    };
+    cancelAnimationFrame(trRaf);
+    trRaf = requestAnimationFrame(tick);
+  };
+  aud.onpause = () => {
+    cancelAnimationFrame(trRaf);
+    $("#trPlay").textContent = "▶ Écouter l'extrait";
+    drawWave();
+  };
+}
+
+function stopTrimAudio(){
+  const aud = $("#trAudio");
+  if (aud && !aud.paused) aud.pause();
+  cancelAnimationFrame(trRaf);
+}
+
+async function exportAudio(){
+  if (trBusy) return;
+  const batch = $("#trBatch").checked;
+  const files = order.filter(n => checked.has(n));
+  if (batch && !files.length) return;
+  if (!batch && !trTrack) return;
+  const destMode = getDestMode();
+  if (destMode === "replace_orig"){
+    const msg = batch
+      ? `Remplacer définitivement les ${files.length} fichier(s) d'origine dans input/ ?`
+      : `Écraser définitivement le fichier d'origine « ${trTrack} » dans input/ ?`;
+    if (!confirm(msg)) return;
+  }
+  stopTrimAudio();
+  trBusy = true;
+  $("#trResult").hidden = true;
+  $("#trErr").hidden = true;
+  $("#trProgBox").hidden = false;
+  $("#trProgName").textContent = batch ? `Conversion de ${files.length} morceaux…` : `Découpe / conversion de ${trTrack}…`;
+  $("#trProgSt").textContent = "0 %";
+  $("#trProgBar").style.width = "0%";
+  updateTrimAction();
+  const payload = {
+    batch,
+    files,
+    file: trTrack,
+    start: Number(trStart.toFixed(3)),
+    end: Number(trEnd.toFixed(3)),
+    fmt: trFmt,
+    kbps: parseInt($("#trKbps").value, 10),
+    wav_bits: parseInt($("#trWavBits").value, 10),
+    fade_in: parseFloat($("#trFadeIn").value) || 0,
+    fade_out: parseFloat($("#trFadeOut").value) || 0,
+    keep_meta: $("#trKeepMeta").checked,
+    title: $("#trTagTitle").value,
+    artist: $("#trTagArtist").value,
+    out_name: $("#trOutName").value,
+    dest_mode: destMode,
+    overwrite: $("#trOverwrite").checked
+  };
+  const r = await post("/api/audio/export", payload);
+  if (!r.ok){
+    trBusy = false;
+    $("#trProgBox").hidden = true;
+    const err = $("#trErr");
+    err.textContent = "Erreur : " + (r.error || "Échec de l'export audio");
+    err.hidden = false;
+    updateTrimAction();
+    return;
+  }
+  await refresh(true);
+}
+
+function renderAudioJob(){
+  const aj = S && S.audio_job;
+  const progBox = $("#trProgBox");
+  if (!aj || !aj.id){
+    progBox.hidden = true;
+    return;
+  }
+  if (aj.running){
+    trBusy = true;
+    progBox.hidden = false;
+    const prefix = aj.batch && aj.count > 1 ? `[${aj.index}/${aj.count}] ` : "";
+    $("#trProgName").textContent = prefix + (aj.current || aj.name || "Export en cours…");
+    const pct = Math.max(0, Math.min(100, Number(aj.progress) || 0));
+    $("#trProgSt").textContent = `${Math.floor(pct)} %` + (aj.speed && aj.speed !== "N/A" ? ` · ${aj.speed}` : "");
+    $("#trProgBar").style.width = pct + "%";
+    updateTrimAction();
+    return;
+  }
+  trBusy = false;
+  progBox.hidden = true;
+  updateTrimAction();
+  if (aj.id === lastAudioJobId) return;
+  lastAudioJobId = aj.id;
+  if (aj.status === "err"){
+    const err = $("#trErr");
+    err.textContent = "Erreur : " + (aj.error || "Échec de l'export audio");
+    err.hidden = false;
+    return;
+  }
+  if (aj.status === "cancel"){
+    const err = $("#trErr");
+    err.textContent = "Export annulé.";
+    err.hidden = false;
+    return;
+  }
+  if (aj.status === "ok" && aj.result){
+    const r = aj.result;
+    const box = $("#trResult");
+    box.innerHTML = "";
+    const txt = el("span");
+    if (r.batch){
+      txt.innerHTML = `<b>✓ ${r.count} fichier${r.count>1?"s":""} ${r.replaced ? "remplacé" + (r.count>1?"s":"") + " et " : ""}converti${r.count>1?"s":""}</b> dans <code>output/</code> (${fmtBytes(r.size)})`;
+    } else if (r.replaced){
+      txt.innerHTML = `<b>✓ Fichier d'origine remplacé :</b> <code></code> (${fmtPrecise(r.duration)} · ${fmtBytes(r.size)})`;
+      txt.querySelector("code").textContent = r.input_name || r.out;
+    } else {
+      txt.innerHTML = `<b>✓ Copie créée :</b> <code></code> (${fmtPrecise(r.duration)} · ${fmtBytes(r.size)})`;
+      txt.querySelector("code").textContent = r.out;
+    }
+    const grow = el("div", "grow");
+    const openBtn = el("button", "btn small", r.batch ? "Ouvrir output/" : "▶ Ouvrir le fichier");
+    openBtn.onclick = () => post("/api/open", r.batch ? {what: "output"} : {what: "out_file", name: r.out});
+    box.append(txt, grow, openBtn);
+    if (!r.batch){
+      const dirBtn = el("button", "btn small", "Dossier output");
+      dirBtn.onclick = () => post("/api/open", {what: "output"});
+      box.appendChild(dirBtn);
+    }
+    if (r.input_name){
+      const vidBtn = el("button", "btn small", "🎬 Utiliser pour une vidéo");
+      vidBtn.onclick = () => {
+        selected = r.input_name;
+        checked.add(r.input_name);
+        setTab("video");
+        renderFiles();
+      };
+      box.appendChild(vidBtn);
+    }
+    box.hidden = false;
+    if (r.replaced && r.input_name){
+      selected = r.input_name;
+      checked.add(r.input_name);
+      trTrack = null;
+      syncTrimTrack();
+    }
+  }
 }
 
 /* ── jaquette d'un morceau ── */
@@ -4141,11 +5311,15 @@ async function refresh(once){
     const r = await fetch("/api/state",{cache:"no-store"}); S = await r.json();
     $("#offline").classList.remove("on");
     const first = !settings;
-    if (first){ globalSet = S.settings; tracks = S.tracks || {}; settings = globalSet; }
+    if (first){
+      globalSet = S.settings; tracks = S.tracks || {}; settings = globalSet;
+      if (S.audio_job && S.audio_job.id && !S.audio_job.running) lastAudioJobId = S.audio_job.id;
+    }
     fillImages(); applySettings();
-    renderFiles(); renderJobs(); renderStatus();
+    renderFiles(); renderJobs(); renderAudioJob(); renderStatus();
     if (first) useSettingsFor();
-    if (S.running) next = 700;
+    if (curTab === "audio") syncTrimTrack();
+    if (S.running || (S.audio_job && S.audio_job.running)) next = 400;
   }catch(e){ $("#offline").classList.add("on"); next = 3000; }
   timer = setTimeout(refresh, next);
 }
@@ -4169,7 +5343,75 @@ function renderStatus(){
 }
 
 /* ── démarrage ── */
-buildStyles(); bindInputs(); bindPicker();
+buildStyles(); buildAudioFmts(); bindInputs(); bindPicker(); bindWaveform();
+$$("#mainTabs .tab").forEach(b => b.onclick = () => setTab(b.dataset.tab));
+$("#trPlay").onclick = () => {
+  const aud = $("#trAudio");
+  if (!trDur) return;
+  if (aud.paused){
+    if (aud.currentTime < trStart || aud.currentTime >= trEnd - 0.05) aud.currentTime = trStart;
+    trCurTime = aud.currentTime;
+    aud.play().catch(() => {});
+  } else aud.pause();
+};
+$("#trFromStart").onclick = () => {
+  const aud = $("#trAudio");
+  if (!trDur) return;
+  aud.currentTime = trStart; trCurTime = trStart; drawWave();
+};
+$("#trTestEnd").onclick = () => {
+  const aud = $("#trAudio");
+  if (!trDur) return;
+  const t = Math.max(trStart, trEnd - 3.5);
+  aud.currentTime = t; trCurTime = t;
+  aud.play().catch(() => {});
+};
+$("#trFull").onclick = () => {
+  if (!trDur) return;
+  trStart = 0; trEnd = trDur; trCurTime = 0;
+  $("#trAudio").currentTime = 0;
+  updateTrimTimesUI();
+};
+$("#trSetStart").onclick = () => {
+  if (!trDur) return;
+  trStart = Math.max(0, Math.min(trCurTime, trEnd - 0.2));
+  updateTrimTimesUI();
+};
+$("#trSetEnd").onclick = () => {
+  if (!trDur) return;
+  trEnd = Math.min(trDur, Math.max(trCurTime, trStart + 0.2));
+  updateTrimTimesUI();
+};
+$$("[data-step]").forEach(b => {
+  b.onclick = () => {
+    if (!trDur) return;
+    const [which, delta] = b.dataset.step.split(":");
+    const d = parseFloat(delta);
+    if (which === "s"){
+      trStart = Math.max(0, Math.min(trStart + d, trEnd - 0.2));
+      trCurTime = trStart;
+      if ($("#trAudio").paused) $("#trAudio").currentTime = trStart;
+    } else {
+      trEnd = Math.min(trDur, Math.max(trEnd + d, trStart + 0.2));
+    }
+    updateTrimTimesUI();
+  };
+});
+$("#trStartInp").onchange = e => {
+  trStart = Math.max(0, Math.min(parseTime(e.target.value, trStart), trEnd - 0.2));
+  trCurTime = trStart;
+  if ($("#trAudio").paused) $("#trAudio").currentTime = trStart;
+  updateTrimTimesUI();
+};
+$("#trEndInp").onchange = e => {
+  trEnd = Math.min(trDur, Math.max(parseTime(e.target.value, trEnd), trStart + 0.2));
+  updateTrimTimesUI();
+};
+$("#trOutName").oninput = () => { trNameEdited = true; };
+$("#trFadeIn").onchange = $("#trFadeOut").onchange = $("#trKeepMeta").onchange = $("#trBatch").onchange = applyTrimFmt;
+$$('input[name="trDestMode"]').forEach(r => r.onchange = applyTrimFmt);
+$("#trCancel").onclick = () => post("/api/audio/cancel").then(() => refresh(true));
+$("#trExportBtn").onclick = exportAudio;
 $("#mix").checked = mixOn; $("#mixName").hidden = !mixOn; if (window._mixName) $("#mixName").value = window._mixName;
 $("#mix").onchange = e => { mixOn = e.target.checked; $("#mixName").hidden = !mixOn; saveMix(); renderFiles(); };
 $("#mixName").oninput = saveMix;
@@ -4209,7 +5451,7 @@ $("#go").onclick = async () => {
   if (!r.ok) alert(r.error || "Erreur"); refresh(true);
 };
 $("#quit").onclick = async () => {
-  if (S && S.running && !confirm("Une conversion est en cours. Quitter quand même ?")) return;
+  if (S && (S.running || (S.audio_job && S.audio_job.running)) && !confirm("Une conversion est en cours. Quitter quand même ?")) return;
   await post("/api/quit"); clearTimeout(timer);
   $("#offMsg").textContent = "Tu peux fermer cet onglet. Pour revenir, relance Onde2Vid.";
   $("#offline").classList.add("on");
